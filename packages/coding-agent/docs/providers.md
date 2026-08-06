@@ -18,6 +18,7 @@ Use `/login` in interactive mode, then select a provider:
 - ChatGPT Plus/Pro (Codex)
 - Claude Pro/Max
 - GitHub Copilot
+- Chutes (Sign in with Chutes)
 
 Use `/logout` to clear credentials. Tokens are stored in `~/.prime/agent/auth.json` and auto-refresh when expired.
 
@@ -34,6 +35,13 @@ Anthropic subscription auth is active for Claude Pro/Max accounts. Third-party h
 
 - Press Enter for github.com, or enter your GitHub Enterprise Server domain
 - If you get "model not supported", enable it in VS Code: Copilot Chat → model selector → select model → "Enable"
+
+### Chutes
+
+- "Sign in with Chutes" (OAuth 2.0 authorization code + PKCE) as an alternative to pasting a `CHUTES_API_KEY`
+- Grants the `chutes:invoke` scope, so inference runs against — and is billed to — your own Chutes account
+- The browser is sent to `api.chutes.ai/idp/authorize`; the callback lands on `http://localhost:51789/auth/chutes/callback`
+- Tokens auto-refresh; pick `Chutes` under `/logout` to sign out
 
 ## API Keys
 
