@@ -110,6 +110,12 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "groq", model: "openai/gpt-oss-120b", label: "groq-gpt-oss-120b" },
 	// Hugging Face
 	{ provider: "huggingface", model: "moonshotai/Kimi-K2.5", label: "huggingface-kimi-k2.5" },
+	// Chutes (one pair per distinct model family)
+	{ provider: "chutes", model: "moonshotai/Kimi-K3-TEE", label: "chutes-kimi-k3-tee" },
+	{ provider: "chutes", model: "deepseek-ai/DeepSeek-V4-Flash-0731-TEE", label: "chutes-deepseek-v4-flash" },
+	{ provider: "chutes", model: "zai-org/GLM-5.2-TEE", label: "chutes-glm-5.2" },
+	{ provider: "chutes", model: "Qwen/Qwen3.5-397B-A17B-TEE", label: "chutes-qwen3.5" },
+	{ provider: "chutes", model: "google/gemma-4-31B-turbo-TEE", label: "chutes-gemma-4" },
 	// Kimi For Coding
 	{ provider: "kimi-coding", model: getKimiCodingTestModel().id, label: "kimi-coding" },
 	// Mistral
