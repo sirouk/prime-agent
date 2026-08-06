@@ -5,10 +5,19 @@
  * for OAuth-based providers:
  * - Anthropic (Claude Pro/Max)
  * - GitHub Copilot
+ * - Chutes (Sign in with Chutes)
  */
 
 // Anthropic
 export { anthropicOAuthProvider, loginAnthropic, refreshAnthropicToken } from "./anthropic.js";
+// Chutes (Sign in with Chutes)
+export {
+	CHUTES_CLIENT_ID,
+	chutesOAuthProvider,
+	loginChutes,
+	refreshChutesToken,
+	revokeChutesToken,
+} from "./chutes.js";
 // GitHub Copilot
 export {
 	getGitHubCopilotBaseUrl,
@@ -27,12 +36,14 @@ export * from "./types.js";
 // ============================================================================
 
 import { anthropicOAuthProvider } from "./anthropic.js";
+import { chutesOAuthProvider } from "./chutes.js";
 import { githubCopilotOAuthProvider } from "./github-copilot.js";
 import { openaiCodexOAuthProvider } from "./openai-codex.js";
 import type { OAuthCredentials, OAuthProviderId, OAuthProviderInfo, OAuthProviderInterface } from "./types.js";
 
 const BUILT_IN_OAUTH_PROVIDERS: OAuthProviderInterface[] = [
 	anthropicOAuthProvider,
+	chutesOAuthProvider,
 	githubCopilotOAuthProvider,
 	openaiCodexOAuthProvider,
 ];
