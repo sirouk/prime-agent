@@ -3141,8 +3141,9 @@ export const MODELS = {
 			api: "openai-completions",
 			provider: "chutes",
 			baseUrl: "https://llm.chutes.ai/v1",
-			compat: {"supportsDeveloperRole":false},
+			compat: {"supportsDeveloperRole":false,"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"deepseek"},
 			reasoning: true,
+			thinkingLevelMap: {"minimal":null,"low":null,"medium":null,"high":"high","xhigh":"max"},
 			input: ["text"],
 			cost: {
 				input: 0.14,

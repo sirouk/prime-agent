@@ -1223,7 +1223,12 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 				const m = model as ModelsDevModel;
 				if (m.tool_call !== true) continue;
 
-				models.push({
+				// Chutes model IDs use upstream casing (e.g. deepseek-ai/DeepSeek-V4-...),
+				// so the shared case-sensitive deepseek-v4 pass below misses them.
+				// Apply the same DeepSeek V4 contract here, scoped to Chutes only.
+				const isDeepSeekV4 = modelId.toLowerCase().includes("deepseek-v4");
+
+				const chutesModel: Model<any> = {
 					id: modelId,
 					name: m.name || modelId,
 					api: "openai-completions",
@@ -1239,10 +1244,15 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					},
 					compat: {
 						supportsDeveloperRole: false,
+						...(isDeepSeekV4 ? DEEPSEEK_V4_COMPAT : {}),
 					},
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
-				});
+				};
+				if (isDeepSeekV4) {
+					mergeThinkingLevelMap(chutesModel, DEEPSEEK_V4_THINKING_LEVEL_MAP);
+				}
+				models.push(chutesModel);
 			}
 		}
 

@@ -548,6 +548,22 @@ describe("AI Providers Unicode Surrogate Pair Tests", () => {
 		});
 	});
 
+	describe.skipIf(!process.env.CHUTES_API_KEY)("Chutes Provider Unicode Handling", () => {
+		const llm = getModel("chutes", "moonshotai/Kimi-K3-TEE");
+
+		it("should handle emoji in tool results", { retry: 3, timeout: 30000 }, async () => {
+			await testEmojiInToolResults(llm);
+		});
+
+		it("should handle real-world LinkedIn comment data with emoji", { retry: 3, timeout: 30000 }, async () => {
+			await testRealWorldLinkedInData(llm);
+		});
+
+		it("should handle unpaired high surrogate (0xD83D) in tool results", { retry: 3, timeout: 30000 }, async () => {
+			await testUnpairedHighSurrogate(llm);
+		});
+	});
+
 	describe.skipIf(!process.env.ZAI_API_KEY)("zAI Provider Unicode Handling", () => {
 		const llm = getZaiTestModel({ toolStream: true });
 

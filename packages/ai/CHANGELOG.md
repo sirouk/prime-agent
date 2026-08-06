@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added Chutes as a built-in API-key provider (OpenAI-compatible endpoint at `https://llm.chutes.ai/v1`) with the 11 tool-capable models from the models.dev catalog, resolved via `CHUTES_API_KEY` / the `chutes` auth.json key.
+
 ## [0.7.1] - 2026-08-07
 
 ## [0.7.0] - 2026-08-05

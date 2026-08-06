@@ -110,6 +110,8 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "groq", model: "openai/gpt-oss-120b", label: "groq-gpt-oss-120b" },
 	// Hugging Face
 	{ provider: "huggingface", model: "moonshotai/Kimi-K2.5", label: "huggingface-kimi-k2.5" },
+	// Chutes
+	{ provider: "chutes", model: "moonshotai/Kimi-K3-TEE", label: "chutes-kimi-k3-tee" },
 	// Kimi For Coding
 	{ provider: "kimi-coding", model: getKimiCodingTestModel().id, label: "kimi-coding" },
 	// Mistral

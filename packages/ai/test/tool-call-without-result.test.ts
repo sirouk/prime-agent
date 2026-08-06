@@ -193,6 +193,14 @@ describe("Tool Call Without Result Tests", () => {
 		});
 	});
 
+	describe.skipIf(!process.env.CHUTES_API_KEY)("Chutes Provider", () => {
+		const model = getModel("chutes", "moonshotai/Kimi-K3-TEE");
+
+		it("should filter out tool calls without corresponding tool results", { retry: 3, timeout: 30000 }, async () => {
+			await testToolCallWithoutResult(model);
+		});
+	});
+
 	describe.skipIf(!process.env.ZAI_API_KEY)("zAI Provider", () => {
 		const model = getZaiTestModel({ toolStream: true });
 

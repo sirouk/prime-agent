@@ -373,6 +373,29 @@ describe("totalTokens field", () => {
 	});
 
 	// =========================================================================
+	// Chutes
+	// =========================================================================
+
+	describe.skipIf(!process.env.CHUTES_API_KEY)("Chutes", () => {
+		it(
+			"Kimi-K3-TEE - should return totalTokens equal to sum of components",
+			{ retry: 3, timeout: 60000 },
+			async () => {
+				const llm = getModel("chutes", "moonshotai/Kimi-K3-TEE");
+
+				console.log(`\nChutes / ${llm.id}:`);
+				const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.CHUTES_API_KEY });
+
+				logUsage("First request", first);
+				logUsage("Second request", second);
+
+				assertTotalTokensEqualsComponents(first);
+				assertTotalTokensEqualsComponents(second);
+			},
+		);
+	});
+
+	// =========================================================================
 	// z.ai
 	// =========================================================================
 
