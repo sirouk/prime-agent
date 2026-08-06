@@ -40,6 +40,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	moonshotai: "kimi-k2.6",
 	"moonshotai-cn": "kimi-k2.6",
 	huggingface: "moonshotai/Kimi-K2.6",
+	chutes: "moonshotai/Kimi-K3-TEE",
 	fireworks: "accounts/fireworks/models/kimi-k2p6",
 	opencode: "kimi-k2.6",
 	"opencode-go": "kimi-k2.6",

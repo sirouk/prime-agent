@@ -250,6 +250,22 @@ describe("Context overflow error handling", () => {
 		}, 120000);
 	});
 
+	// =============================================================================
+	// Chutes
+	// Uses OpenAI-compatible TEE gateway
+	// =============================================================================
+
+	describe.skipIf(!process.env.CHUTES_API_KEY)("Chutes", () => {
+		it("Kimi-K3-TEE - should detect overflow via isContextOverflow", async () => {
+			const model = getModel("chutes", "moonshotai/Kimi-K3-TEE");
+			const result = await testContextOverflow(model, process.env.CHUTES_API_KEY!);
+			logResult(result);
+
+			expect(result.stopReason).toBe("error");
+			expect(isContextOverflow(result.response, model.contextWindow)).toBe(true);
+		}, 120000);
+	});
+
 	describe.skipIf(!process.env.ZAI_API_KEY)("z.ai", () => {
 		it("should detect overflow via isContextOverflow when z.ai reports it", async () => {
 			const model = getZaiTestModel({ smallestContextWindow: true });
