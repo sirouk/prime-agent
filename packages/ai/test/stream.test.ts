@@ -799,11 +799,11 @@ describe("Generate E2E Tests", () => {
 		});
 
 		it("should handle thinking mode", { retry: 3 }, async () => {
-			await handleThinking(llm, { reasoningEffort: "xhigh" });
+			await handleThinking(llm, { reasoningEffort: "max" });
 		});
 
 		it("should handle multi-turn with thinking and tools", { retry: 3 }, async () => {
-			await multiTurn(llm, { reasoningEffort: "xhigh" });
+			await multiTurn(llm, { reasoningEffort: "max" });
 		});
 	});
 
