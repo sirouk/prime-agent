@@ -182,6 +182,14 @@ describe("Token Statistics on Abort", () => {
 		});
 	});
 
+	describe.skipIf(!process.env.CHUTES_API_KEY)("Chutes Provider", () => {
+		const llm = getModel("chutes", "moonshotai/Kimi-K3-TEE");
+
+		it("should include token stats when aborted mid-stream", { retry: 3, timeout: 30000 }, async () => {
+			await testTokensOnAbort(llm);
+		});
+	});
+
 	describe.skipIf(!process.env.ZAI_API_KEY)("zAI Provider", () => {
 		const llm = getZaiTestModel();
 

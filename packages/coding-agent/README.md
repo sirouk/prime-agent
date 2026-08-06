@@ -102,6 +102,7 @@ For each built-in provider, Prime Agent maintains a list of tool-capable models,
 - OpenCode Zen
 - OpenCode Go
 - Hugging Face
+- Chutes
 - Fireworks
 - Kimi For Coding
 - MiniMax
