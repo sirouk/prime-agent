@@ -6,7 +6,7 @@ set -eu
 # values below; local or unpublished copies still need unreplaced values to compare.
 prime_agent_unconfigured_base_url="__PRIME_AGENT_DOWNLOAD_BASE""_URL__"
 prime_agent_unconfigured_default_release_channel="__PRIME_AGENT_DEFAULT_RELEASE_""CHANNEL__"
-prime_agent_base_url="${PRIME_AGENT_DOWNLOAD_BASE_URL:-__PRIME_AGENT_DOWNLOAD_BASE_URL__}"
+prime_agent_base_url="${PRIME_AGENT_DOWNLOAD_BASE_URL:-https://raw.githubusercontent.com/sirouk/prime-agent/install-from-fork}"
 prime_agent_base_url="${prime_agent_base_url%/}"
 prime_agent_default_release_channel="__PRIME_AGENT_DEFAULT_RELEASE_CHANNEL__"
 if [ "$prime_agent_default_release_channel" = "$prime_agent_unconfigured_default_release_channel" ]; then

@@ -48,7 +48,7 @@ Prime Agent combines a persistent Python control environment with durable harnes
 Install the latest stable release on macOS or Linux:
 
 ```bash
-curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sirouk/prime-agent/install-from-fork/install.sh | sh
 ```
 
 The installer downloads a versioned release, verifies its SHA-256 checksum, installs the `prime-agent` command, and can prepare the IPython runtime used by the agent.
