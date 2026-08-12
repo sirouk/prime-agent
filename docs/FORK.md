@@ -51,6 +51,36 @@ Upstream inserts new version headers at the top of that file on every release,
 which made it the only recurring conflict. The Chutes changes are described in
 the generated GitHub Release notes instead.
 
+## The update channel
+
+Upstream hard-codes its own R2 bucket in `packages/coding-agent/src/utils/version-check.ts`
+as the place to look for new releases. Left alone, an installed fork build
+compares its `0.7.2-chutes.1` against upstream's `0.7.2` — and because a
+prerelease sorts *below* the plain release, it reports "Update available:
+v0.7.2" and `/update` would replace the Chutes build with stock Prime Agent.
+
+`fork-release.yml` therefore rewrites that constant (and its test and docs) to
+this fork's base URL **at build time**, in the working tree only. Nothing is
+committed, so the overlay branch gains no conflict surface. The step fails the
+build if the upstream URL is no longer found, so a rename upstream is caught
+loudly rather than silently shipping a self-downgrading build.
+
+Result: released builds check `https://sirouk.github.io/prime-agent/latest.json`,
+`/update` installs this fork's tarball, and `-chutes.N` increments are seen as
+updates while upstream releases are not.
+
+You still learn about upstream releases — the daily sync rebases onto them and
+cuts a new `-chutes.N` automatically, so an upstream release becomes a fork
+release (and a new GitHub Release entry) within a day.
+
+To temporarily point an installed build somewhere else without rebuilding:
+
+```sh
+export PRIME_AGENT_DOWNLOAD_BASE_URL=https://sirouk.github.io/prime-agent
+```
+
+`PI_SKIP_VERSION_CHECK=1` disables the check entirely.
+
 ## Versioning
 
 Releases are versioned `<upstream-version>-chutes.<N>`, e.g. `0.7.2-chutes.1`.

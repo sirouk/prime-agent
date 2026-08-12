@@ -162,6 +162,39 @@ jobs:
           ref: ${{ needs.context.outputs.build_sha }}
           persist-credentials: false
 
+      # Upstream hard-codes its own R2 bucket as the update channel, so a fork
+      # build would see upstream's plain 0.7.x as "newer" than 0.7.x-chutes.N
+      # (a prerelease sorts below the release) and offer an update that silently
+      # replaces the Chutes build with stock Prime Agent. Retarget it here.
+      #
+      # Done in the working tree rather than as a committed patch: the source
+      # stays byte-identical to upstream, so the overlay branch gains no extra
+      # rebase conflict surface. If upstream ever renames or moves the constant,
+      # this fails loudly instead of shipping a build that self-downgrades.
+      - name: Point this build at the fork's update channel
+        env:
+          BASE_URL: ${{ needs.context.outputs.base_url }}
+        run: |
+          set -eu
+          UPSTREAM_BASE='https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev'
+          if ! grep -rq "$UPSTREAM_BASE" --include='*.ts' --include='*.md' .; then
+            echo "::error::Upstream download base URL '$UPSTREAM_BASE' no longer appears in the tree." \
+              "The update-channel retarget in fork-release.yml is stale and must be updated," \
+              "otherwise released builds would offer upstream releases as updates." >&2
+            exit 1
+          fi
+          # Literal string replace (not sed) so the URL's dots are never treated
+          # as regex metacharacters.
+          replace='import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace(sys.argv[2], sys.argv[3]))'
+          grep -rl "$UPSTREAM_BASE" --include='*.ts' --include='*.md' . | while read -r file; do
+            python3 -c "$replace" "$file" "$UPSTREAM_BASE" "$BASE_URL"
+            echo "retargeted $file"
+          done
+          if grep -rq "$UPSTREAM_BASE" --include='*.ts' --include='*.md' .; then
+            echo "::error::Some references to the upstream channel survived the rewrite." >&2
+            exit 1
+          fi
+
       - name: Setup Node.js
         uses: actions/setup-node@v7.0.0
         with:
