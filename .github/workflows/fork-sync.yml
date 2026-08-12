@@ -80,7 +80,12 @@ jobs:
         run: |
           set -eu
           git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
-          git fetch --tags upstream "$UPSTREAM_BRANCH"
+          # Deliberately no --tags: upstream's moving "beta" tag collides with the
+          # fork's copy ("would clobber existing tag"), which makes fetch exit
+          # non-zero and kills the step under `set -e`. Release versions are
+          # derived from this fork's own v*-chutes.* tags, so upstream tags are
+          # not needed here.
+          git fetch upstream "$UPSTREAM_BRANCH"
 
           before=$(git rev-parse HEAD)
           if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
@@ -96,7 +101,6 @@ jobs:
           after=$(git rev-parse HEAD)
           if [ "$before" != "$after" ]; then
             git push origin HEAD:main
-            git push --tags origin || true
           fi
           echo "main_sha=$after" >> "$GITHUB_OUTPUT"
 
@@ -140,12 +144,20 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Rebased ${OVERLAY_BRANCH}: ${before} -> ${after}"
 
+      # Best-effort: Issues are disabled on forks by default, and a failed
+      # notification must never mask the real failure above.
       - name: Open an issue on conflict
         if: failure()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eu
+          set -u
+          if ! gh api "repos/${GITHUB_REPOSITORY}" --jq .has_issues | grep -qx true; then
+            echo "::warning::Issues are disabled on this repository, so no conflict issue was filed." \
+              "Enable Settings -> General -> Features -> Issues to get notified here."
+            exit 0
+          fi
           title="Fork sync failed: ${OVERLAY_BRANCH} needs a manual rebase"
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "\"$title\" in:title" --json number --jq '.[0].number' || true)
@@ -178,8 +190,11 @@ jobs:
     needs: sync
     if: ${{ inputs.skip_release != true }}
     uses: ./.github/workflows/fork-release.yml
+    # Must cover every permission the called workflow's jobs request, or the
+    # run fails at startup before any job is created.
     permissions:
       contents: write
+      pages: write
     secrets: inherit
     with:
       ref: ${{ needs.sync.outputs.overlay_sha }}

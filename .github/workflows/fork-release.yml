@@ -475,9 +475,10 @@ jobs:
 
           export PATH="$(npm prefix -g)/bin:$HOME/.local/bin:$PATH"
           command -v prime-agent
-          installed=$(prime-agent --version)
+          # --version reports on stderr, so capture both streams.
+          installed=$(prime-agent --version 2>&1 | tr -d '\r')
           echo "Installed: $installed"
-          printf '%s' "$installed" | grep -q "$RELEASE_VERSION"
+          printf '%s' "$installed" | grep -qF "$RELEASE_VERSION"
 
       - name: Summary
         run: |

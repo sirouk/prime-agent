@@ -99,8 +99,15 @@ human-visible download page.
 ## One-time repository setup
 
 - **Settings → Pages**: source = *Deploy from a branch*, branch = `gh-pages`,
-  folder = `/ (root)`. The first release run creates the branch; set this after
-  it exists.
+  folder = `/ (root)`. Already configured. The release workflow tries to set
+  this automatically, but `GITHUB_TOKEN` usually cannot create a Pages site for
+  the first time, so the initial enablement is manual; after that it sticks.
+- **Settings → General → Features → Issues** is off by default on forks. The
+  sync workflow's conflict notification is best-effort and will only warn in the
+  run log until Issues is enabled. Failures still show as a red run either way.
+- Upstream's own `Release Prime Agent` workflow (`build-binaries.yml`) publishes
+  to Cloudflare R2 and can never succeed here, so it is **disabled** in this
+  fork's Actions settings. It is left on disk so it never conflicts on sync.
 - **Settings → Actions → General → Workflow permissions**: *Read and write
   permissions*, and allow Actions to create pull requests is not required.
 - **Actions must be enabled** — forks start with workflows disabled, so the
