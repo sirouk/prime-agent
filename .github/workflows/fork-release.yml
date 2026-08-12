@@ -1,0 +1,489 @@
+name: Fork Release (Chutes)
+
+# Builds the Chutes-enabled fork and publishes it to GitHub Pages in the exact
+# layout install.sh expects:
+#
+#   <base>/install.sh                       rendered installer (stable channel)
+#   <base>/install-beta.sh                  rendered installer (beta channel)
+#   <base>/stable                           "v<version>"
+#   <base>/latest.json                      release manifest
+#   <base>/releases/v<version>/*.tgz        package tarballs
+#   <base>/releases/v<version>/SHA256SUMS   checksums
+#
+# That layout is required by BOTH install.sh and scripts/pack-prime-agent-release.mjs
+# (which bakes <base>/releases/v<version>/<file> into the cross-package dependency
+# URLs inside the tarballs), which is why we serve a static site rather than raw
+# GitHub Release assets. Builds are still mirrored to a GitHub Release for
+# durability and human-visible download links.
+#
+# Normally invoked by fork-sync.yml after it rebases the overlay branch. Can also
+# be run directly, or triggered by a human push to the overlay branch.
+
+on:
+  push:
+    branches:
+      - chutes
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build. Defaults to the chutes overlay branch.'
+        required: false
+        default: chutes
+        type: string
+      version:
+        description: 'Explicit release version, e.g. 0.7.2-chutes.3. Blank auto-derives the next -chutes.N.'
+        required: false
+        type: string
+      skip_tests:
+        description: 'Skip all tests (build and check still run).'
+        required: false
+        default: false
+        type: boolean
+      full_tests:
+        description: 'Also run the slower coding-agent suite (needs uv).'
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        default: chutes
+        type: string
+      version:
+        required: false
+        type: string
+      skip_tests:
+        required: false
+        default: false
+        type: boolean
+      full_tests:
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PAGES_BRANCH: gh-pages
+  # Number of past release directories kept on the Pages branch.
+  KEEP_RELEASES: '12'
+
+jobs:
+  context:
+    name: Resolve release context
+    runs-on: ubuntu-latest
+    outputs:
+      base_url: ${{ steps.resolve.outputs.base_url }}
+      build_ref: ${{ steps.resolve.outputs.build_ref }}
+      build_sha: ${{ steps.resolve.outputs.build_sha }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
+      upstream_version: ${{ steps.resolve.outputs.upstream_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Resolve version and base URL
+        id: resolve
+        env:
+          INPUT_REF: ${{ inputs.ref || github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          PAGES_BASE_URL: ${{ vars.PAGES_BASE_URL }}
+        run: |
+          set -eu
+
+          build_sha=$(git rev-parse HEAD)
+          upstream_version=$(node -p "require('./packages/coding-agent/package.json').version")
+
+          requested="${INPUT_VERSION#v}"
+          if [ -n "$requested" ]; then
+            release_version="$requested"
+          else
+            n=1
+            while git rev-parse -q --verify "refs/tags/v${upstream_version}-chutes.${n}" >/dev/null 2>&1; do
+              n=$((n + 1))
+            done
+            release_version="${upstream_version}-chutes.${n}"
+          fi
+
+          # install.sh and the pack script both accept [0-9A-Za-z.-] only.
+          case "$release_version" in
+            *[!0-9A-Za-z.-]*)
+              echo "Invalid release version: $release_version" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ -n "${PAGES_BASE_URL:-}" ]; then
+            base_url="${PAGES_BASE_URL%/}"
+          else
+            owner=$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+            repo="${GITHUB_REPOSITORY#*/}"
+            base_url="https://${owner}.github.io/${repo}"
+          fi
+
+          {
+            echo "base_url=$base_url"
+            echo "build_ref=$INPUT_REF"
+            echo "build_sha=$build_sha"
+            echo "release_tag=v${release_version}"
+            echo "release_version=$release_version"
+            echo "upstream_version=$upstream_version"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Build ref        : $INPUT_REF ($build_sha)"
+          echo "Upstream version : $upstream_version"
+          echo "Release version  : $release_version"
+          echo "Base URL         : $base_url"
+
+  build:
+    name: Build and pack
+    runs-on: ubuntu-latest
+    needs: context
+    timeout-minutes: 30
+    env:
+      BASE_URL: ${{ needs.context.outputs.base_url }}
+      RELEASE_VERSION: ${{ needs.context.outputs.release_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.context.outputs.build_sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Check
+        run: npm run check
+
+      # The Chutes delta lives entirely in packages/ai (plus three one-line
+      # touches in coding-agent), and these three suites need no uv/Python.
+      # This mirrors ci.yml's install_uv:false matrix entries.
+      - name: Test (ai, agent, tui)
+        if: inputs.skip_tests != true
+        run: |
+          set -eu
+          npm test --workspace packages/ai
+          npm test --workspace packages/agent
+          npm test --workspace packages/tui
+
+      # The coding-agent suite needs uv and is much slower, so it is opt-in.
+      - name: Install uv
+        if: inputs.full_tests == true
+        run: |
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Test (coding-agent)
+        if: inputs.full_tests == true
+        working-directory: packages/coding-agent
+        run: npm run test:ci
+
+      - name: Pack release
+        run: |
+          set -eu
+          test -n "$BASE_URL"
+          npm run release:pack -- \
+            --channel stable \
+            --version "$RELEASE_VERSION" \
+            --base-url "$BASE_URL" \
+            --out-dir packages/coding-agent/release/production
+
+      - name: Render installers
+        env:
+          INSTALL_BASE_URL: ${{ needs.context.outputs.base_url }}
+        run: |
+          set -eu
+          mkdir -p rendered
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const baseUrl = process.env.INSTALL_BASE_URL;
+          if (!baseUrl) throw new Error("INSTALL_BASE_URL is required");
+          const installer = fs.readFileSync("install.sh", "utf8");
+          const render = (channel) =>
+            installer
+              .replaceAll("__PRIME_AGENT_DOWNLOAD_BASE_URL__", baseUrl)
+              .replaceAll("__PRIME_AGENT_DEFAULT_RELEASE_CHANNEL__", channel);
+          const stable = render("stable");
+          if (stable.includes("__PRIME_AGENT_DOWNLOAD_BASE_URL__")) {
+            throw new Error("installer still contains unreplaced placeholders");
+          }
+          fs.writeFileSync("rendered/install.sh", stable);
+          fs.writeFileSync("rendered/install-beta.sh", render("beta"));
+          NODE
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-release-artifacts
+          path: packages/coding-agent/release/production/artifacts/*
+          if-no-files-found: error
+
+      - name: Upload rendered installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-release-installers
+          path: rendered/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish to Pages and GitHub Releases
+    runs-on: ubuntu-latest
+    needs: [context, build]
+    permissions:
+      contents: write
+      pages: write
+    env:
+      BASE_URL: ${{ needs.context.outputs.base_url }}
+      BUILD_SHA: ${{ needs.context.outputs.build_sha }}
+      RELEASE_TAG: ${{ needs.context.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.context.outputs.release_version }}
+      UPSTREAM_VERSION: ${{ needs.context.outputs.upstream_version }}
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: fork-release-artifacts
+          path: staging/artifacts
+
+      - name: Download rendered installers
+        uses: actions/download-artifact@v8
+        with:
+          name: fork-release-installers
+          path: staging/installers
+
+      - name: Verify artifacts
+        run: |
+          set -eu
+          cd staging/artifacts
+          test -f "prime-agent-${RELEASE_VERSION}.tgz"
+          test -f SHA256SUMS
+          test -f stable
+          test -f latest.json
+          sha256sum -c SHA256SUMS
+          grep -qx "v${RELEASE_VERSION}" stable
+          test -s ../installers/install.sh
+          grep -q "$BASE_URL" ../installers/install.sh
+
+      - name: Checkout Pages branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git clone --branch "$PAGES_BRANCH" --single-branch "$remote" site 2>/dev/null; then
+            echo "Cloned existing $PAGES_BRANCH."
+          else
+            echo "No $PAGES_BRANCH branch yet; creating an orphan branch."
+            rm -rf site
+            git clone --depth 1 "$remote" site
+            cd site
+            git checkout --orphan "$PAGES_BRANCH"
+            git rm -rf --quiet . >/dev/null 2>&1 || true
+          fi
+
+      - name: Stage release into the site
+        run: |
+          set -eu
+          RELEASE_DIR="site/releases/v${RELEASE_VERSION}"
+          mkdir -p "$RELEASE_DIR"
+
+          cp staging/artifacts/*.tgz "$RELEASE_DIR/"
+          cp staging/artifacts/SHA256SUMS "$RELEASE_DIR/"
+
+          # Channel pointer, manifest and installers live at the site root.
+          cp staging/artifacts/stable site/stable
+          cp staging/artifacts/latest.json site/latest.json
+          cp staging/installers/install.sh site/install.sh
+          cp staging/installers/install-beta.sh site/install-beta.sh
+          chmod +x site/install.sh site/install-beta.sh
+
+          # Pages must not run Jekyll over the release tree.
+          touch site/.nojekyll
+
+          {
+            printf '# Prime Agent (Chutes fork)\n\n'
+            printf 'Install:\n\n'
+            printf '```sh\ncurl -fsSL %s/install.sh | sh\n```\n\n' "$BASE_URL"
+            printf 'Current stable: `v%s`, built from upstream `v%s`.\n' "$RELEASE_VERSION" "$UPSTREAM_VERSION"
+          } > site/index.md
+
+      - name: Prune old releases
+        run: |
+          set -eu
+          cd site/releases
+          count=$(ls -1 | wc -l)
+          if [ "$count" -le "$KEEP_RELEASES" ]; then
+            echo "Keeping all $count release directories."
+            exit 0
+          fi
+          # Name sorting is unreliable for prerelease suffixes, so prune by the
+          # commit that first added each directory: oldest goes first.
+          ls -1 | while read -r dir; do
+            added=$(git log --diff-filter=A --format=%ct -1 -- "$dir" 2>/dev/null || true)
+            printf '%s\t%s\n' "${added:-0}" "$dir"
+          done | sort -n | head -n "$((count - KEEP_RELEASES))" | cut -f2- | while read -r dir; do
+            echo "Pruning $dir"
+            rm -rf "$dir"
+          done
+
+      - name: Commit and push the site
+        run: |
+          set -eu
+          cd site
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Site is already up to date."
+            exit 0
+          fi
+          git commit -m "release: v${RELEASE_VERSION} (upstream v${UPSTREAM_VERSION})"
+          git push origin "HEAD:${PAGES_BRANCH}"
+
+      - name: Ensure GitHub Pages serves the release branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if gh api "repos/${GITHUB_REPOSITORY}/pages" >/dev/null 2>&1; then
+            method=PUT
+          else
+            method=POST
+          fi
+          if gh api --method "$method" "repos/${GITHUB_REPOSITORY}/pages" \
+            -f "source[branch]=${PAGES_BRANCH}" -f "source[path]=/" >/dev/null 2>&1; then
+            echo "Pages is serving ${PAGES_BRANCH} at the site root."
+          else
+            echo "::warning::Could not configure Pages automatically. Set Settings -> Pages" \
+              "to 'Deploy from a branch' = ${PAGES_BRANCH} / (root) once, by hand."
+          fi
+
+      - name: Tag the built commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
+              -F sha="$BUILD_SHA" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" -f sha="$BUILD_SHA" >/dev/null
+          fi
+
+      - name: Mirror to a GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          {
+            printf 'Chutes-enabled build of Prime Agent, built from upstream `v%s`.\n\n' "$UPSTREAM_VERSION"
+            printf '## Install\n\n```sh\ncurl -fsSL %s/install.sh | sh\n```\n\n' "$BASE_URL"
+            printf '## On top of upstream\n\n'
+            printf -- '- `feat(ai): add Chutes provider`\n'
+            printf -- '- `feat(ai): add "Sign in with Chutes" OAuth for the Chutes provider`\n\n'
+            printf 'The attached tarballs are byte-identical to the ones served from\n'
+            printf '`%s/releases/%s/`.\n' "$BASE_URL" "$RELEASE_TAG"
+          } > /tmp/release-notes.md
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" staging/artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --notes-file /tmp/release-notes.md \
+              staging/artifacts/*
+          fi
+
+  verify:
+    name: Verify the published installer
+    runs-on: ubuntu-latest
+    needs: [context, publish]
+    timeout-minutes: 20
+    env:
+      BASE_URL: ${{ needs.context.outputs.base_url }}
+      RELEASE_TAG: ${{ needs.context.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.context.outputs.release_version }}
+      UPSTREAM_VERSION: ${{ needs.context.outputs.upstream_version }}
+    steps:
+      - name: Wait for Pages to serve the new release
+        run: |
+          set -eu
+          url="${BASE_URL}/releases/v${RELEASE_VERSION}/SHA256SUMS"
+          for attempt in $(seq 1 40); do
+            if curl -fsSL --max-time 20 "$url" -o /tmp/SHA256SUMS; then
+              echo "Live after ${attempt} attempt(s)."
+              cat /tmp/SHA256SUMS
+              exit 0
+            fi
+            echo "Attempt ${attempt}: not live yet, retrying in 15s."
+            sleep 15
+          done
+          echo "Timed out waiting for $url" >&2
+          echo "Is GitHub Pages enabled for this repo with source = branch '${PAGES_BRANCH}' / root?" >&2
+          exit 1
+
+      - name: Check the channel pointer
+        run: |
+          set -eu
+          curl -fsSL --max-time 20 "${BASE_URL}/stable" -o /tmp/stable
+          echo "stable -> $(cat /tmp/stable)"
+          grep -qx "v${RELEASE_VERSION}" /tmp/stable
+
+      - name: End-to-end install from the published installer
+        run: |
+          set -eu
+          curl -fsSL --max-time 30 "${BASE_URL}/install.sh" -o /tmp/install.sh
+          grep -q "$BASE_URL" /tmp/install.sh
+
+          # No TTY, so the installer auto-confirms. Skip the IPython runtime
+          # bootstrap: it pulls uv + Python and is not what we are verifying.
+          # The version is resolved through the stable channel, exactly like a
+          # real user's install.
+          PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 \
+          PRIME_AGENT_INSTALLER_PLAIN=1 \
+            sh /tmp/install.sh </dev/null
+
+          export PATH="$(npm prefix -g)/bin:$HOME/.local/bin:$PATH"
+          command -v prime-agent
+          installed=$(prime-agent --version)
+          echo "Installed: $installed"
+          printf '%s' "$installed" | grep -q "$RELEASE_VERSION"
+
+      - name: Summary
+        run: |
+          {
+            printf '## Released `%s`\n\n' "$RELEASE_TAG"
+            printf 'Built from upstream `v%s`.\n\n' "$UPSTREAM_VERSION"
+            printf 'Installer verified end to end:\n\n'
+            printf '```sh\ncurl -fsSL %s/install.sh | sh\n```\n' "$BASE_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

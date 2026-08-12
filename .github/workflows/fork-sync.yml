@@ -1,0 +1,187 @@
+name: Fork Sync (upstream -> chutes)
+
+# Keeps the fork's overlay branch sitting on top of upstream, then releases.
+#
+#   main    = upstream mirror + the single "fork ci" commit that carries these
+#             workflows. Updated by GitHub's "Sync fork" button, by the schedule
+#             below, or manually.
+#   chutes  = main + the Chutes provider/OAuth commits, rebased automatically.
+#
+# Clicking "Sync fork" on main pushes to main, which fires this workflow, which
+# rebases chutes onto the new main and always cuts a release afterwards.
+#
+# A push made with GITHUB_TOKEN does not trigger further workflows, so the
+# release is invoked directly as a reusable workflow rather than relying on the
+# push to chutes.
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # 07:00 UTC daily, as a safety net if nobody clicks Sync fork.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_release:
+        description: 'Rebase the overlay branch but do not publish a release.'
+        required: false
+        default: false
+        type: boolean
+      skip_tests:
+        description: 'Skip all tests during the release build.'
+        required: false
+        default: false
+        type: boolean
+      full_tests:
+        description: 'Also run the slower coding-agent suite during the release build.'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  OVERLAY_BRANCH: chutes
+  UPSTREAM_REPO: https://github.com/PrimeIntellect-ai/prime-agent.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    name: Sync main and rebase the overlay
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      overlay_sha: ${{ steps.rebase.outputs.overlay_sha }}
+      rebased: ${{ steps.rebase.outputs.rebased }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: main
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Merge upstream into main
+        id: upstream
+        run: |
+          set -eu
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --tags upstream "$UPSTREAM_BRANCH"
+
+          before=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "main already contains upstream/${UPSTREAM_BRANCH}."
+          elif git merge --no-edit -m "chore: sync main with upstream" "upstream/${UPSTREAM_BRANCH}"; then
+            echo "Merged upstream/${UPSTREAM_BRANCH} into main."
+          else
+            git merge --abort || true
+            echo "::error::Merging upstream/${UPSTREAM_BRANCH} into main conflicted. Resolve it manually."
+            exit 1
+          fi
+
+          after=$(git rev-parse HEAD)
+          if [ "$before" != "$after" ]; then
+            git push origin HEAD:main
+            git push --tags origin || true
+          fi
+          echo "main_sha=$after" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase the overlay branch onto main
+        id: rebase
+        run: |
+          set -eu
+          git fetch origin "$OVERLAY_BRANCH"
+          before=$(git rev-parse "origin/${OVERLAY_BRANCH}")
+
+          git checkout -B "$OVERLAY_BRANCH" "origin/${OVERLAY_BRANCH}"
+
+          if git merge-base --is-ancestor main HEAD; then
+            echo "Overlay already sits on the current main."
+            echo "rebased=false" >> "$GITHUB_OUTPUT"
+            echo "overlay_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git rebase main; then
+            conflicts=$(git diff --name-only --diff-filter=U || true)
+            git rebase --abort || true
+            {
+              echo "conflict=true"
+              echo "rebased=false"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "CONFLICTS<<EOF"
+              echo "$conflicts"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+            echo "::error::Rebasing ${OVERLAY_BRANCH} onto main conflicted."
+            exit 1
+          fi
+
+          after=$(git rev-parse HEAD)
+          git push --force-with-lease="${OVERLAY_BRANCH}:${before}" origin "HEAD:${OVERLAY_BRANCH}"
+          {
+            echo "rebased=true"
+            echo "overlay_sha=$after"
+          } >> "$GITHUB_OUTPUT"
+          echo "Rebased ${OVERLAY_BRANCH}: ${before} -> ${after}"
+
+      - name: Open an issue on conflict
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          title="Fork sync failed: ${OVERLAY_BRANCH} needs a manual rebase"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number --jq '.[0].number' || true)
+
+          {
+            printf 'Automated sync of `%s` onto `main` failed.\n\n' "$OVERLAY_BRANCH"
+            printf '**Run:** %s/%s/actions/runs/%s\n\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf '**Conflicting paths:**\n\n```\n%s\n```\n\n' "${CONFLICTS:-see the run log}"
+            printf 'Resolve locally:\n\n'
+            printf '```sh\n'
+            printf 'git fetch origin\n'
+            printf 'git checkout -B %s origin/%s\n' "$OVERLAY_BRANCH" "$OVERLAY_BRANCH"
+            printf 'git rebase origin/main\n'
+            printf '# resolve conflicts, then:\n'
+            printf 'git push --force-with-lease origin %s\n' "$OVERLAY_BRANCH"
+            printf '```\n\n'
+            printf 'No release was published for this run.\n'
+          } > /tmp/issue-body.md
+          body=$(cat /tmp/issue-body.md)
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+
+  release:
+    name: Release
+    needs: sync
+    if: ${{ inputs.skip_release != true }}
+    uses: ./.github/workflows/fork-release.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      ref: ${{ needs.sync.outputs.overlay_sha }}
+      skip_tests: ${{ inputs.skip_tests == true }}
+      full_tests: ${{ inputs.full_tests == true }}
