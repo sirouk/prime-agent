@@ -13,6 +13,11 @@ name: Fork Sync (upstream -> chutes)
 # A push made with GITHUB_TOKEN does not trigger further workflows, so the
 # release is invoked directly as a reusable workflow rather than relying on the
 # push to chutes.
+#
+# The overlay only ever adds lines, so the conflict it keeps hitting is an
+# addition whose anchor line upstream has since edited or deleted. That one case
+# is settled automatically by .github/scripts/resolve-overlay-conflicts.py;
+# anything else still stops the run and files an issue.
 
 on:
   push:
@@ -120,7 +125,35 @@ jobs:
             exit 0
           fi
 
-          if ! git rebase main; then
+          # diff3 conflict markers expose the merge base, which the resolver below
+          # needs to tell "upstream deleted these lines" apart from "upstream
+          # rewrote them". Passed per-command rather than written to the repo
+          # config, which is not always writable (e.g. in a linked worktree); the
+          # resolver refuses outright if a base section is missing anyway.
+
+          # The overlay is pure additions, so its only recurring conflict is an
+          # addition whose anchor line upstream has since edited. The resolver
+          # settles exactly that case and leaves everything else conflicted.
+          # Each --continue can stop on the next commit, hence the loop; the
+          # bound is a backstop against a resolver that reports success without
+          # actually reducing the conflict set.
+          autoresolved=0
+          rc=0
+          git -c merge.conflictStyle=diff3 rebase main || rc=$?
+          while [ "$rc" -ne 0 ] && [ "$autoresolved" -lt 20 ]; do
+            if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+              echo "::error::Rebase stopped without conflicts; not something this step can settle."
+              break
+            fi
+            if ! python3 .github/scripts/resolve-overlay-conflicts.py; then
+              break
+            fi
+            autoresolved=$((autoresolved + 1))
+            rc=0
+            GIT_EDITOR=true git -c merge.conflictStyle=diff3 rebase --continue || rc=$?
+          done
+
+          if [ "$rc" -ne 0 ]; then
             conflicts=$(git diff --name-only --diff-filter=U || true)
             git rebase --abort || true
             {
@@ -133,6 +166,20 @@ jobs:
               echo "EOF"
             } >> "$GITHUB_ENV"
             echo "::error::Rebasing ${OVERLAY_BRANCH} onto main conflicted."
+            exit 1
+          fi
+
+          if [ "$autoresolved" -gt 0 ]; then
+            echo "::notice::Auto-resolved pure-insertion conflicts in ${autoresolved} step(s) of the rebase."
+          fi
+
+          # The overlay adds and never removes, so any deletion against main means
+          # the rebase (auto-resolved or not) dropped upstream code. The rebase has
+          # already finished here, so there is nothing to abort -- failing before the
+          # push is what keeps the bad result off the branch.
+          if git diff --numstat main HEAD | awk '$2 != 0 { found = 1 } END { exit !found }'; then
+            echo "::error::The rebased overlay deletes lines relative to main, which it must never do:"
+            git diff --numstat main HEAD | awk '$2 != 0 { print "  " $3 " (-" $2 ")" }'
             exit 1
           fi
 
@@ -167,6 +214,10 @@ jobs:
             printf '**Run:** %s/%s/actions/runs/%s\n\n' \
               "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
             printf '**Conflicting paths:**\n\n```\n%s\n```\n\n' "${CONFLICTS:-see the run log}"
+            printf 'Auto-resolution already ran and declined these, so they are not the\n'
+            printf 'usual "overlay addition lost its anchor" case: upstream rewrote a region\n'
+            printf 'the overlay adds to, or the overlay itself changes an upstream line.\n'
+            printf 'Both need a human. Check the run log for which of the two it was.\n\n'
             printf 'Resolve locally:\n\n'
             printf '```sh\n'
             printf 'git fetch origin\n'
