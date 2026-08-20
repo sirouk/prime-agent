@@ -1,27 +1,27 @@
 {
-  "version": "v0.7.4-chutes.1",
+  "version": "v0.7.4-chutes.2",
   "package": "prime-agent",
-  "tarball": "releases/v0.7.4-chutes.1/prime-agent-0.7.4-chutes.1.tgz",
+  "tarball": "releases/v0.7.4-chutes.2/prime-agent-0.7.4-chutes.2.tgz",
   "tarballs": [
     {
       "package": "prime-agent",
-      "file": "prime-agent-0.7.4-chutes.1.tgz",
-      "sha256": "ad14af8518ad5a34a7ed9975f8d26fcd7370eb0f9aac75366417af88afce78c5"
+      "file": "prime-agent-0.7.4-chutes.2.tgz",
+      "sha256": "b9012e1850cd7325da90043c42c5c5c1a57c699b80fbd3704fcc8305de9ea0e7"
     },
     {
       "package": "prime-agent-ai",
-      "file": "prime-agent-ai-0.7.4-chutes.1.tgz",
-      "sha256": "79c1a769f0c97a5a296d20fb79f59151d01a88a66c1f1a4ce50ec79a160b67d1"
+      "file": "prime-agent-ai-0.7.4-chutes.2.tgz",
+      "sha256": "e652a7c55f6ea7907636a9198c73f01f0820968aab6bb685bb68952fdd869588"
     },
     {
       "package": "prime-agent-core",
-      "file": "prime-agent-core-0.7.4-chutes.1.tgz",
-      "sha256": "08617e44e0c2bfc2f196e9f3dfeb4b6536cd9334811e7662bef173f4d3b17868"
+      "file": "prime-agent-core-0.7.4-chutes.2.tgz",
+      "sha256": "041f7b26234ad312697b9b3a15f1968f3dd846eba93d89327d1026f37fbb8126"
     },
     {
       "package": "prime-agent-tui",
-      "file": "prime-agent-tui-0.7.4-chutes.1.tgz",
-      "sha256": "4599427a1099432970ca0c94a207f4813fb196eacbd813091ff30a4c62c16975"
+      "file": "prime-agent-tui-0.7.4-chutes.2.tgz",
+      "sha256": "9a4ea9da7cb498006743851540b33d31951b02ddc86f4b64f0bdbc1514b238c2"
     }
   ]
 }
