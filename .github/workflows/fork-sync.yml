@@ -177,9 +177,31 @@ jobs:
           # the rebase (auto-resolved or not) dropped upstream code. The rebase has
           # already finished here, so there is nothing to abort -- failing before the
           # push is what keeps the bad result off the branch.
-          if git diff --numstat main HEAD | awk '$2 != 0 { found = 1 } END { exit !found }'; then
-            echo "::error::The rebased overlay deletes lines relative to main, which it must never do:"
-            git diff --numstat main HEAD | awk '$2 != 0 { print "  " $3 " (-" $2 ")" }'
+          #
+          # One file is exempt: the root README, where the overlay rewrites the
+          # install command to this fork's channel. That rewrite is a replacement,
+          # not an addition, so it necessarily deletes a line. Note the resolver
+          # cannot settle a conflict there -- rewrites are exactly what it declines
+          # -- so an upstream edit to that line means a manual rebase.
+          OVERLAY_MAY_MODIFY='README.md'
+          if git diff --numstat main HEAD |
+            awk -v allow="$OVERLAY_MAY_MODIFY" '
+              BEGIN { n = split(allow, list, " "); for (i = 1; i <= n; i++) exempt[list[i]] = 1 }
+              $2 != 0 && !($3 in exempt) { found = 1 }
+              END { exit !found }'; then
+            echo "::error::The rebased overlay deletes lines relative to main outside the exempt paths:"
+            git diff --numstat main HEAD |
+              awk -v allow="$OVERLAY_MAY_MODIFY" '
+                BEGIN { n = split(allow, list, " "); for (i = 1; i <= n; i++) exempt[list[i]] = 1 }
+                $2 != 0 && !($3 in exempt) { print "  " $3 " (-" $2 ")" }'
+            exit 1
+          fi
+
+          # Positive check on the one exempted rewrite: if a rebase ever puts
+          # upstream's install command back, the fork would ship a README telling
+          # people to install upstream's build.
+          if grep -q 'app\.primeintellect\.ai/prime-agent/install\.sh' README.md; then
+            echo "::error::README.md advertises upstream's installer again; the overlay's rewrite was lost in the rebase."
             exit 1
           fi
 
