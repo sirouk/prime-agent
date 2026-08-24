@@ -14,10 +14,10 @@ name: Fork Sync (upstream -> chutes)
 # release is invoked directly as a reusable workflow rather than relying on the
 # push to chutes.
 #
-# The overlay only ever adds lines, so the conflict it keeps hitting is an
-# addition whose anchor line upstream has since edited or deleted. That one case
-# is settled automatically by .github/scripts/resolve-overlay-conflicts.py;
-# anything else still stops the run and files an issue.
+# Most overlay commits only add lines, so their recurring conflict is an addition
+# whose anchor upstream edited or deleted. That one case is settled automatically
+# by .github/scripts/resolve-overlay-conflicts.py. The reviewed kernel patches
+# modify existing lines; any conflict there still stops the run and files an issue.
 
 on:
   push:
@@ -131,9 +131,8 @@ jobs:
           # config, which is not always writable (e.g. in a linked worktree); the
           # resolver refuses outright if a base section is missing anyway.
 
-          # The overlay is pure additions, so its only recurring conflict is an
-          # addition whose anchor line upstream has since edited. The resolver
-          # settles exactly that case and leaves everything else conflicted.
+          # The resolver settles only a pure addition whose anchor upstream has
+          # since edited. Kernel-patch conflicts deliberately remain conflicted.
           # Each --continue can stop on the next commit, hence the loop; the
           # bound is a backstop against a resolver that reports success without
           # actually reducing the conflict set.
@@ -173,17 +172,12 @@ jobs:
             echo "::notice::Auto-resolved pure-insertion conflicts in ${autoresolved} step(s) of the rebase."
           fi
 
-          # The overlay adds and never removes, so any deletion against main means
-          # the rebase (auto-resolved or not) dropped upstream code. The rebase has
-          # already finished here, so there is nothing to abort -- failing before the
-          # push is what keeps the bad result off the branch.
-          #
-          # One file is exempt: the root README, where the overlay rewrites the
-          # install command to this fork's channel. That rewrite is a replacement,
-          # not an addition, so it necessarily deletes a line. Note the resolver
-          # cannot settle a conflict there -- rewrites are exactly what it declines
-          # -- so an upstream edit to that line means a manual rebase.
-          OVERLAY_MAY_MODIFY='README.md'
+          # Most overlay commits are pure additions. The exact paths below are the
+          # reviewed exceptions: the README install-channel rewrite and the kernel
+          # safety patches. Any deletion elsewhere means the rebase dropped upstream
+          # code, so fail before the push. The resolver remains pure-insertion-only;
+          # upstream edits to patched source still require manual review.
+          OVERLAY_MAY_MODIFY='README.md packages/coding-agent/src/cli/daemon-ps.ts packages/coding-agent/src/core/kernel/fork-server.ts packages/coding-agent/src/core/kernel/index.ts packages/coding-agent/src/core/tools/ipython.ts packages/coding-agent/test/daemon-ps.test.ts packages/coding-agent/test/ipython-provisioner.test.ts packages/coding-agent/test/kernel-fork-server-protocol.test.ts packages/coding-agent/test/kernel-startup.test.ts'
           if git diff --numstat main HEAD |
             awk -v allow="$OVERLAY_MAY_MODIFY" '
               BEGIN { n = split(allow, list, " "); for (i = 1; i <= n; i++) exempt[list[i]] = 1 }
