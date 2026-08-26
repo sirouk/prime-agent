@@ -6,4 +6,4 @@ Install:
 curl -fsSL https://sirouk.github.io/prime-agent/install.sh | sh
 ```
 
-Current stable: `v0.8.0-chutes.5`, built from upstream `v0.8.0`.
+Current stable: `v0.8.0-chutes.6`, built from upstream `v0.8.0`.
