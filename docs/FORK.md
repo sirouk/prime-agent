@@ -101,7 +101,7 @@ safe.
 curl -fsSL https://sirouk.github.io/prime-agent/install.sh | sh
 ```
 
-Beta channel installer (same artifacts, `beta` channel default):
+Beta channel installer (same artifacts and manifest, `beta` channel default):
 
 ```sh
 curl -fsSL https://sirouk.github.io/prime-agent/install-beta.sh | sh
@@ -154,8 +154,18 @@ human-visible download page.
 ## Keeping site size in check
 
 `fork-release.yml` keeps the most recent `KEEP_RELEASES` (default 12) version
-directories on `gh-pages` and prunes older ones. Each release is roughly 10 MB.
-The branch accumulates history; if it ever gets unwieldy, squash it:
+directories on `gh-pages` and prunes older ones. The release staged by the
+current run is excluded from that run's prune candidates; only older committed
+release directories are eligible. Before the site commit is pushed, the
+workflow verifies the retained-release limit, stable/beta pointers and
+manifests, installers, and checksums. Because pushes
+made with `GITHUB_TOKEN` do not trigger Pages builds, the workflow explicitly
+requests a Pages build after pushing `gh-pages` and waits for that exact commit.
+The `check:fork-release` npm script exercises the 12-existing-plus-1-new
+retention boundary against the workflow's own shell steps.
+
+Each release is roughly 10 MB. The branch accumulates history; if it ever gets
+unwieldy, squash it:
 
 ```sh
 git checkout gh-pages

@@ -6,7 +6,9 @@ name: Fork Release (Chutes)
 #   <base>/install.sh                       rendered installer (stable channel)
 #   <base>/install-beta.sh                  rendered installer (beta channel)
 #   <base>/stable                           "v<version>"
+#   <base>/beta                             "v<version>" (same fork release)
 #   <base>/latest.json                      release manifest
+#   <base>/beta.json                        beta manifest (same fork release)
 #   <base>/releases/v<version>/*.tgz        package tarballs
 #   <base>/releases/v<version>/SHA256SUMS   checksums
 #
@@ -125,6 +127,15 @@ jobs:
               ;;
           esac
 
+          release_tag="v${release_version}"
+          if git rev-parse -q --verify "refs/tags/${release_tag}" >/dev/null 2>&1; then
+            tagged_sha=$(git rev-list -n 1 "$release_tag")
+            if [ "$tagged_sha" != "$build_sha" ]; then
+              echo "::error::${release_tag} already targets ${tagged_sha}; refusing to move it to ${build_sha}." >&2
+              exit 1
+            fi
+          fi
+
           if [ -n "${PAGES_BASE_URL:-}" ]; then
             base_url="${PAGES_BASE_URL%/}"
           else
@@ -137,7 +148,7 @@ jobs:
             echo "base_url=$base_url"
             echo "build_ref=$INPUT_REF"
             echo "build_sha=$build_sha"
-            echo "release_tag=v${release_version}"
+            echo "release_tag=$release_tag"
             echo "release_version=$release_version"
             echo "upstream_version=$upstream_version"
           } >> "$GITHUB_OUTPUT"
@@ -357,14 +368,26 @@ jobs:
         run: |
           set -eu
           RELEASE_DIR="site/releases/v${RELEASE_VERSION}"
+          # An explicitly repeated version must not retain artifacts from its
+          # previous build. Refuse to replace a complete release with different
+          # bytes; a missing checksum file is repairable from the same build.
+          if [ -f "$RELEASE_DIR/SHA256SUMS" ] && \
+            ! cmp -s staging/artifacts/SHA256SUMS "$RELEASE_DIR/SHA256SUMS"; then
+            echo "::error::Release v${RELEASE_VERSION} already exists with different checksums." >&2
+            exit 1
+          fi
+          rm -rf -- "$RELEASE_DIR"
           mkdir -p "$RELEASE_DIR"
 
           cp staging/artifacts/*.tgz "$RELEASE_DIR/"
           cp staging/artifacts/SHA256SUMS "$RELEASE_DIR/"
 
-          # Channel pointer, manifest and installers live at the site root.
+          # This fork has one release stream. Both installer entrypoints follow
+          # the same artifacts while retaining their expected channel names.
           cp staging/artifacts/stable site/stable
+          cp staging/artifacts/stable site/beta
           cp staging/artifacts/latest.json site/latest.json
+          cp staging/artifacts/latest.json site/beta.json
           cp staging/installers/install.sh site/install.sh
           cp staging/installers/install-beta.sh site/install-beta.sh
           chmod +x site/install.sh site/install-beta.sh
@@ -383,22 +406,151 @@ jobs:
         run: |
           set -eu
           cd site/releases
-          count=$(ls -1 | wc -l)
+          current_release="v${RELEASE_VERSION}"
+          count=$(find . -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')
           if [ "$count" -le "$KEEP_RELEASES" ]; then
             echo "Keeping all $count release directories."
             exit 0
           fi
+          prune_count=$((count - KEEP_RELEASES))
+          candidates=$(mktemp)
+          trap 'rm -f "$candidates"' EXIT
+
           # Name sorting is unreliable for prerelease suffixes, so prune by the
           # commit that first added each directory: oldest goes first.
-          ls -1 | while read -r dir; do
+          for path in */; do
+            dir=${path%/}
+            version_part=${dir#v}
+            case "$version_part" in
+              ""|"$dir"|*[!0-9A-Za-z.-]*)
+                echo "::error::Unexpected entry in the release directory: $dir" >&2
+                exit 1
+                ;;
+            esac
+            # The release staged in this run is not committed yet, so git has no
+            # creation timestamp for it. Exclude it instead of treating it as
+            # the oldest release and immediately pruning it.
+            if [ "$dir" = "$current_release" ]; then
+              continue
+            fi
             added=$(git log --diff-filter=A --format=%ct -1 -- "$dir" 2>/dev/null || true)
-            printf '%s\t%s\n' "${added:-0}" "$dir"
-          done | sort -n | head -n "$((count - KEEP_RELEASES))" | cut -f2- | while read -r dir; do
-            echo "Pruning $dir"
-            rm -rf "$dir"
+            if [ -z "$added" ]; then
+              echo "::error::Release directory $dir has no committed creation time; refusing to prune." >&2
+              exit 1
+            fi
+            printf '%s\t%s\n' "$added" "$dir" >> "$candidates"
           done
 
+          candidate_count=$(wc -l < "$candidates" | tr -d '[:space:]')
+          if [ "$candidate_count" -lt "$prune_count" ]; then
+            echo "::error::Need $prune_count prune candidates, but found $candidate_count." >&2
+            exit 1
+          fi
+
+          sort -n "$candidates" | head -n "$prune_count" | cut -f2- | while read -r dir; do
+            echo "Pruning $dir"
+            rm -rf -- "$dir"
+          done
+
+          remaining=$(find . -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')
+          if [ "$remaining" -ne "$KEEP_RELEASES" ] || [ ! -d "$current_release" ]; then
+            echo "::error::Pruning retained $remaining releases or removed $current_release." >&2
+            exit 1
+          fi
+
+      - name: Verify staged site
+        run: |
+          set -eu
+          release_dir="site/releases/v${RELEASE_VERSION}"
+          release_count=$(find site/releases -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')
+
+          if [ "$release_count" -gt "$KEEP_RELEASES" ]; then
+            echo "::error::Staged site retains $release_count releases; expected at most $KEEP_RELEASES." >&2
+            exit 1
+          fi
+
+          test -f "$release_dir/SHA256SUMS"
+          (cd "$release_dir" && sha256sum -c SHA256SUMS)
+          grep -qx "v${RELEASE_VERSION}" site/stable
+          grep -qx "v${RELEASE_VERSION}" site/beta
+          cmp -s site/latest.json site/beta.json
+          test -s site/install.sh
+          test -s site/install-beta.sh
+          grep -Fq "$BASE_URL" site/install.sh
+          grep -Fq "$BASE_URL" site/install-beta.sh
+
+          node - "$release_dir" "$RELEASE_VERSION" <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const [releaseDir, releaseVersion] = process.argv.slice(2);
+          const manifest = JSON.parse(fs.readFileSync("site/latest.json", "utf8"));
+          const expectedVersion = `v${releaseVersion}`;
+          const expectedTarball = `releases/${expectedVersion}/prime-agent-${releaseVersion}.tgz`;
+
+          if (manifest.version !== expectedVersion) {
+            throw new Error(`latest.json points to ${manifest.version}; expected ${expectedVersion}`);
+          }
+          if (manifest.tarball !== expectedTarball) {
+            throw new Error(`latest.json points to ${manifest.tarball}; expected ${expectedTarball}`);
+          }
+          if (!Array.isArray(manifest.tarballs) || manifest.tarballs.length === 0) {
+            throw new Error("latest.json has no tarball inventory");
+          }
+
+          const checksumLines = fs
+            .readFileSync(path.join(releaseDir, "SHA256SUMS"), "utf8")
+            .trim()
+            .split("\n");
+          const checksums = new Map(
+            checksumLines.map((line) => {
+              const match = line.match(/^([a-f0-9]{64})  (.+)$/);
+              if (!match) throw new Error(`Malformed SHA256SUMS entry: ${line}`);
+              if (path.basename(match[2]) !== match[2]) {
+                throw new Error(`Unsafe SHA256SUMS filename: ${match[2]}`);
+              }
+              return [match[2], match[1]];
+            }),
+          );
+
+          if (checksums.size !== checksumLines.length) {
+            throw new Error("SHA256SUMS contains duplicate tarball names");
+          }
+          const manifestFiles = new Set();
+          for (const tarball of manifest.tarballs) {
+            if (
+              typeof tarball.file !== "string" ||
+              path.basename(tarball.file) !== tarball.file ||
+              !/^[a-f0-9]{64}$/.test(tarball.sha256)
+            ) {
+              throw new Error("latest.json contains invalid tarball metadata");
+            }
+            if (manifestFiles.has(tarball.file)) {
+              throw new Error(`latest.json contains duplicate tarball: ${tarball.file}`);
+            }
+            manifestFiles.add(tarball.file);
+            if (checksums.get(tarball.file) !== tarball.sha256) {
+              throw new Error(`Checksum metadata mismatch for ${tarball.file}`);
+            }
+          }
+          const actualTarballs = fs
+            .readdirSync(releaseDir)
+            .filter((file) => file.endsWith(".tgz"))
+            .sort();
+          const expectedTarballs = [...checksums.keys()].sort();
+          if (
+            manifestFiles.size !== checksums.size ||
+            JSON.stringify(actualTarballs) !== JSON.stringify(expectedTarballs)
+          ) {
+            throw new Error("latest.json, SHA256SUMS, and staged tarballs have different inventories");
+          }
+          if (!manifestFiles.has(`prime-agent-${releaseVersion}.tgz`)) {
+            throw new Error("latest.json omits the primary Prime Agent tarball");
+          }
+          NODE
+
       - name: Commit and push the site
+        id: publish_site
         run: |
           set -eu
           cd site
@@ -407,37 +559,64 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "Site is already up to date."
+            echo "site_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git commit -m "release: v${RELEASE_VERSION} (upstream v${UPSTREAM_VERSION})"
           git push origin "HEAD:${PAGES_BRANCH}"
+          echo "site_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure GitHub Pages serves the release branch
+      - name: Configure and request the GitHub Pages build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SITE_SHA: ${{ steps.publish_site.outputs.site_sha }}
         run: |
           set -eu
-          if gh api "repos/${GITHUB_REPOSITORY}/pages" >/dev/null 2>&1; then
-            method=PUT
+          expected_source=$(printf '%s\t/' "$PAGES_BRANCH")
+          if source=$(gh api "repos/${GITHUB_REPOSITORY}/pages" \
+            --jq '[.source.branch // "", .source.path // ""] | @tsv' 2>/dev/null); then
+            if [ "$source" != "$expected_source" ]; then
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/pages" \
+                -f "source[branch]=${PAGES_BRANCH}" -f "source[path]=/" >/dev/null
+            fi
           else
-            method=POST
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/pages" \
+              -f "source[branch]=${PAGES_BRANCH}" -f "source[path]=/" >/dev/null
           fi
-          if gh api --method "$method" "repos/${GITHUB_REPOSITORY}/pages" \
-            -f "source[branch]=${PAGES_BRANCH}" -f "source[path]=/" >/dev/null 2>&1; then
-            echo "Pages is serving ${PAGES_BRANCH} at the site root."
-          else
-            echo "::warning::Could not configure Pages automatically. Set Settings -> Pages" \
-              "to 'Deploy from a branch' = ${PAGES_BRANCH} / (root) once, by hand."
-          fi
+          # GITHUB_TOKEN-authored pushes do not trigger Pages builds. Request
+          # the build explicitly after the gh-pages commit is available.
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null
+          echo "Requested a Pages build for $SITE_SHA from ${PAGES_BRANCH} at the site root."
+
+          for attempt in $(seq 1 60); do
+            build=$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest")
+            build_status=$(printf '%s' "$build" | jq -r '.status // ""')
+            build_commit=$(printf '%s' "$build" | jq -r '.commit // ""')
+            echo "Attempt $attempt: Pages build $build_commit is $build_status."
+            if [ "$build_commit" = "$SITE_SHA" ] && [ "$build_status" = "built" ]; then
+              exit 0
+            fi
+            if [ "$build_commit" = "$SITE_SHA" ] && [ "$build_status" = "errored" ]; then
+              printf '%s' "$build" | jq -r '.error.message // "Pages build failed"' >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "::error::Timed out waiting for Pages to build $SITE_SHA." >&2
+          exit 1
 
       - name: Tag the built commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
-              -F sha="$BUILD_SHA" -F force=true >/dev/null
+          if existing_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+            --jq '.object.sha' 2>/dev/null); then
+            if [ "$existing_sha" != "$BUILD_SHA" ]; then
+              echo "::error::${RELEASE_TAG} already targets ${existing_sha}; expected ${BUILD_SHA}." >&2
+              exit 1
+            fi
+            echo "${RELEASE_TAG} already targets ${BUILD_SHA}."
           else
             gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
               -f ref="refs/tags/${RELEASE_TAG}" -f sha="$BUILD_SHA" >/dev/null
@@ -498,12 +677,18 @@ jobs:
           echo "Is GitHub Pages enabled for this repo with source = branch '${PAGES_BRANCH}' / root?" >&2
           exit 1
 
-      - name: Check the channel pointer
+      - name: Check the channel pointers and manifests
         run: |
           set -eu
           curl -fsSL --max-time 20 "${BASE_URL}/stable" -o /tmp/stable
+          curl -fsSL --max-time 20 "${BASE_URL}/beta" -o /tmp/beta
+          curl -fsSL --max-time 20 "${BASE_URL}/latest.json" -o /tmp/latest.json
+          curl -fsSL --max-time 20 "${BASE_URL}/beta.json" -o /tmp/beta.json
           echo "stable -> $(cat /tmp/stable)"
+          echo "beta   -> $(cat /tmp/beta)"
           grep -qx "v${RELEASE_VERSION}" /tmp/stable
+          grep -qx "v${RELEASE_VERSION}" /tmp/beta
+          cmp -s /tmp/latest.json /tmp/beta.json
 
       - name: End-to-end install from the published installer
         run: |
