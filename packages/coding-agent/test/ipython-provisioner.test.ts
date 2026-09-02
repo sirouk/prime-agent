@@ -164,6 +164,27 @@ describe("IpythonKernelProvisioner", () => {
 		expect(countRuns()).toBe(2);
 	});
 
+	it("re-provisions after a memoized kernel exits unexpectedly", async () => {
+		const { python, countRuns } = writeFakePython();
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python });
+		const deadManager = { isRunning: false, kill: vi.fn(async () => {}) } as unknown as KernelClient;
+		Object.assign(
+			provisioner as unknown as {
+				managerPromise: Promise<KernelClient>;
+				startedManager: KernelClient;
+			},
+			{
+				managerPromise: Promise.resolve(deadManager),
+				startedManager: deadManager,
+			},
+		);
+
+		await expect(provisioner.ensure()).rejects.toThrow(/Kernel exited before ready/);
+
+		expect(countRuns()).toBe(1);
+		expect(deadManager.kill).not.toHaveBeenCalled();
+	});
+
 	it("prewarm() swallows the failure and the next ensure() starts fresh", async () => {
 		const { python, countRuns } = writeFakePython();
 		const provisioner = new IpythonKernelProvisioner(tempDir, { python });

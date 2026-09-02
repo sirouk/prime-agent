@@ -1,0 +1,1 @@
+- Fixed Python kernel recovery after an unexpected REPL process exit.
