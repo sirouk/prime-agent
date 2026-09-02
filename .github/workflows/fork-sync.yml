@@ -8,16 +8,16 @@ name: Fork Sync (upstream -> chutes)
 #   chutes  = main + the Chutes provider/OAuth commits, rebased automatically.
 #
 # Clicking "Sync fork" on main pushes to main, which fires this workflow, which
-# rebases chutes onto the new main and always cuts a release afterwards.
+# rebases chutes onto the new main and cuts a release when the overlay moves.
 #
 # A push made with GITHUB_TOKEN does not trigger further workflows, so the
 # release is invoked directly as a reusable workflow rather than relying on the
 # push to chutes.
 #
-# Most overlay commits only add lines, so their recurring conflict is an addition
+# Most overlay changes only add lines, so their recurring conflict is an addition
 # whose anchor upstream edited or deleted. That one case is settled automatically
-# by .github/scripts/resolve-overlay-conflicts.py. The reviewed kernel patches
-# modify existing lines; any conflict there still stops the run and files an issue.
+# by .github/scripts/resolve-overlay-conflicts.py. Every other conflict stops the
+# run and files an issue for human review.
 
 on:
   push:
@@ -80,6 +80,9 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
+      - name: Verify the conflict resolver
+        run: python3 .github/scripts/test-resolve-overlay-conflicts.py
+
       - name: Merge upstream into main
         id: upstream
         run: |
@@ -132,7 +135,7 @@ jobs:
           # resolver refuses outright if a base section is missing anyway.
 
           # The resolver settles only a pure addition whose anchor upstream has
-          # since edited. Kernel-patch conflicts deliberately remain conflicted.
+          # since been deleted. All other conflict shapes remain conflicted.
           # Each --continue can stop on the next commit, hence the loop; the
           # bound is a backstop against a resolver that reports success without
           # actually reducing the conflict set.
@@ -172,12 +175,11 @@ jobs:
             echo "::notice::Auto-resolved pure-insertion conflicts in ${autoresolved} step(s) of the rebase."
           fi
 
-          # Most overlay commits are pure additions. The exact paths below are the
-          # reviewed exceptions: the README install-channel rewrite and the kernel
-          # safety patches. Any deletion elsewhere means the rebase dropped upstream
-          # code, so fail before the push. The resolver remains pure-insertion-only;
-          # upstream edits to patched source still require manual review.
-          OVERLAY_MAY_MODIFY='README.md packages/coding-agent/src/cli/daemon-ps.ts packages/coding-agent/src/core/kernel/fork-server.ts packages/coding-agent/src/core/kernel/index.ts packages/coding-agent/src/core/tools/ipython.ts packages/coding-agent/test/daemon-ps.test.ts packages/coding-agent/test/ipython-provisioner.test.ts packages/coding-agent/test/kernel-fork-server-protocol.test.ts packages/coding-agent/test/kernel-startup.test.ts'
+          # Most overlay commits are pure additions. The one reviewed exception is
+          # the README install-channel rewrite. Any deletion elsewhere means the
+          # rebase dropped upstream code, so fail before the push. The resolver
+          # remains pure-insertion-only; edits to upstream lines require review.
+          OVERLAY_MAY_MODIFY='README.md'
           if git diff --numstat main HEAD |
             awk -v allow="$OVERLAY_MAY_MODIFY" '
               BEGIN { n = split(allow, list, " "); for (i = 1; i <= n; i++) exempt[list[i]] = 1 }
@@ -244,18 +246,16 @@ jobs:
             printf '```\n\n'
             printf 'No release was published for this run.\n'
           } > /tmp/issue-body.md
-          body=$(cat /tmp/issue-body.md)
-
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file /tmp/issue-body.md
           else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file /tmp/issue-body.md
           fi
 
   release:
     name: Release
     needs: sync
-    if: ${{ inputs.skip_release != true }}
+    if: ${{ inputs.skip_release != true && needs.sync.outputs.rebased == 'true' }}
     uses: ./.github/workflows/fork-release.yml
     # Must cover every permission the called workflow's jobs request, or the
     # run fails at startup before any job is created.

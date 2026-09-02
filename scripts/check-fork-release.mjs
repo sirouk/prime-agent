@@ -13,8 +13,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const workflowSource = readFileSync(".github/workflows/fork-release.yml", "utf8");
+const syncWorkflowSource = readFileSync(".github/workflows/fork-sync.yml", "utf8");
 const tempRoot = mkdtempSync(join(tmpdir(), "prime-agent-fork-release-"));
 const baseUrl = "https://example.github.io/prime-agent";
+const gitLocalEnvironmentVariables = spawnSync("git", ["rev-parse", "--local-env-vars"], {
+	encoding: "utf8",
+}).stdout
+	.trim()
+	.split(/\s+/);
+const isolatedProcessEnvironment = { ...process.env };
+for (const variable of gitLocalEnvironmentVariables) {
+	delete isolatedProcessEnvironment[variable];
+}
 
 function extractRunStep(stepName) {
 	const stepMarker = `      - name: ${stepName}\n`;
@@ -49,7 +59,7 @@ function run(command, args, options = {}) {
 	const result = spawnSync(command, args, {
 		cwd: options.cwd,
 		encoding: "utf8",
-		env: options.env ?? process.env,
+		env: options.env ?? isolatedProcessEnvironment,
 	});
 	if (result.error) {
 		throw result.error;
@@ -104,7 +114,7 @@ function commitRelease(fixture, release, sequence) {
 	runChecked("git", ["commit", "--quiet", "-m", `release: ${release}`], {
 		cwd: fixture.site,
 		env: {
-			...process.env,
+			...isolatedProcessEnvironment,
 			GIT_AUTHOR_DATE: commitDate,
 			GIT_COMMITTER_DATE: commitDate,
 		},
@@ -172,7 +182,7 @@ function runWorkflowStep(stepName, fixture, releaseVersion) {
 	return runExtractedStep(stepName, {
 		cwd: fixture.root,
 		env: {
-			...process.env,
+			...isolatedProcessEnvironment,
 			BASE_URL: baseUrl,
 			KEEP_RELEASES: "12",
 			RELEASE_VERSION: releaseVersion,
@@ -244,7 +254,7 @@ function checkImmutableVersionTag() {
 	runChecked("git", ["tag", "v0.8.1-chutes.1"], { cwd: root });
 
 	const env = {
-		...process.env,
+		...isolatedProcessEnvironment,
 		GITHUB_OUTPUT: outputPath,
 		GITHUB_REPOSITORY: "example/prime-agent",
 		INPUT_REF: "chutes",
@@ -287,6 +297,12 @@ try {
 	assert(
 		pagesStep.includes('[ "$build_commit" = "$SITE_SHA" ]'),
 		"Pages step does not bind completion to the pushed site commit",
+	);
+	assert(
+		syncWorkflowSource.includes(
+			"if: ${{ inputs.skip_release != true && needs.sync.outputs.rebased == 'true' }}",
+		),
+		"Fork sync publishes a release when the overlay did not move",
 	);
 	checkImmutableVersionTag();
 

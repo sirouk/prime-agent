@@ -9,7 +9,7 @@ automatic.
 | Branch          | What it is                                                                 |
 | --------------- | -------------------------------------------------------------------------- |
 | `main`          | Upstream `PrimeIntellect-ai/prime-agent@main`, plus fork-maintenance workflows and documentation. Safe to update with GitHub's **Sync fork** button. |
-| `chutes`        | `main` plus the Chutes provider/OAuth and kernel-safety overlay commits. **Rebased and force-pushed by CI** — never commit anything here that you are not willing to see replayed. |
+| `chutes`        | `main` plus the Chutes provider/OAuth, installer-doc, and REPL-recovery overlay commits. **Rebased and force-pushed by CI** — never commit anything here that you are not willing to see replayed. |
 | `gh-pages`      | The published release site. Written only by CI. |
 | `chutes-provider` | Untouched import of `chutesai/prime-agent@chutes-provider`, kept for provenance. Not maintained. |
 | `chutes-oauth`  | Untouched import of `fstandhartinger/prime-agent@chutes-oauth`, kept for provenance. Not maintained. |
@@ -51,11 +51,11 @@ Upstream inserts new version headers at the top of that file on every release,
 which made it the only recurring conflict. The Chutes changes are described in
 the generated GitHub Release notes instead.
 
-The kernel-safety overlay prevents daemon discovery from probing internal
-forkserver sockets and re-provisions Python after any other unexpected kernel
-death. Its exact source/test paths are allowlisted by `fork-sync.yml`; conflicts
-inside those paths still stop the rebase for manual review. Every release runs
-the four focused regression files before packaging.
+The small runtime overlay re-provisions the Python REPL after an unexpected
+kernel process exit. It adds no deletion exception to `fork-sync.yml`: a future
+runtime rewrite stops for manual review instead of silently carrying old kernel
+code forward. Every release runs the focused provisioner regression before
+packaging.
 
 ## The update channel
 

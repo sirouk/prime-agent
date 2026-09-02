@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Auto-resolve the one conflict class the Chutes overlay actually produces.
+"""Auto-resolve the one safe conflict class in the Chutes overlay.
 
-The overlay only ever *adds* lines. It conflicts with upstream when upstream
-edits the lines it anchored those additions to -- typically by deleting a
-neighbouring comment banner. Git cannot place the addition and stops.
+Most provider/OAuth integration points only *add* lines. They conflict with
+upstream when upstream edits the lines that anchored those additions --
+typically by deleting a neighbouring comment banner. Git cannot place the
+addition and stops.
 
 Such a hunk is resolved here iff, in diff3 terms:
 
@@ -18,7 +19,9 @@ just deleted, silently reverting part of upstream's change.
 
 Anything else -- upstream rewriting the region, the overlay deleting or
 modifying an upstream line, a delete/modify conflict, a binary file -- is left
-alone so the rebase fails loudly and a human decides.
+alone so the rebase fails loudly and a human decides. Unmerged index stages are
+checked before reading the working tree because modify/delete conflicts have no
+marker hunk and must never be mistaken for an empty successful resolution.
 
 Exit 0 if every conflicted path was fully resolved and staged, 1 otherwise.
 """
@@ -39,6 +42,18 @@ def git(*args):
 def unmerged_paths():
     out = git("diff", "--name-only", "--diff-filter=U", "-z")
     return [p for p in out.split("\0") if p]
+
+
+def unmerged_stage_sets():
+    out = git("ls-files", "--unmerged", "-z")
+    stages = {}
+    for record in out.split("\0"):
+        if not record:
+            continue
+        metadata, path = record.split("\t", 1)
+        stage = int(metadata.rsplit(" ", 1)[1])
+        stages.setdefault(path, set()).add(stage)
+    return stages
 
 
 def split_hunks(lines, path):
@@ -122,6 +137,10 @@ def resolve(path):
         out.extend(added)
         resolved += 1
 
+    if resolved == 0:
+        print(f"  {path}: no diff3 conflict hunks; leaving it conflicted")
+        return False
+
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("".join(out))
     print(f"  {path}: auto-resolved {resolved} pure-insertion hunk(s)")
@@ -132,6 +151,19 @@ def main():
     paths = unmerged_paths()
     if not paths:
         print("No conflicted paths to resolve.")
+        return 1
+
+    stage_sets = unmerged_stage_sets()
+    unsupported = [
+        (path, stage_sets.get(path, set()))
+        for path in paths
+        if stage_sets.get(path, set()) != {1, 2, 3}
+    ]
+    if unsupported:
+        print("Refusing non-content conflict(s):")
+        for path, stages in unsupported:
+            rendered = ",".join(str(stage) for stage in sorted(stages)) or "none"
+            print(f"  {path}: unmerged index stages {rendered}; expected 1,2,3")
         return 1
 
     print(f"Attempting auto-resolution of {len(paths)} conflicted path(s):")

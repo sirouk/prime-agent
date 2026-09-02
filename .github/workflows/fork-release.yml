@@ -227,16 +227,11 @@ jobs:
       - name: Check
         run: npm run check
 
-      # These focused regressions protect the fork's kernel safety overlay and
-      # run on every release, including emergency builds that skip broad suites.
-      - name: Test (kernel safety overlay)
+      # This focused regression protects the fork's REPL recovery overlay and
+      # runs on every release, including emergency builds that skip broad suites.
+      - name: Test (kernel recovery overlay)
         working-directory: packages/coding-agent
-        run: |
-          npx tsx ../../node_modules/vitest/dist/cli.js --run \
-            test/daemon-ps.test.ts \
-            test/ipython-provisioner.test.ts \
-            test/kernel-fork-server-protocol.test.ts \
-            test/kernel-startup.test.ts
+        run: npx tsx ../../node_modules/vitest/dist/cli.js --run test/ipython-provisioner.test.ts
 
       # The Chutes provider delta lives in packages/ai (plus small coding-agent
       # integration points), and these three suites need no uv/Python. This
@@ -633,8 +628,7 @@ jobs:
             printf '## On top of upstream\n\n'
             printf -- '- `feat(ai): add Chutes provider`\n'
             printf -- '- `feat(ai): add "Sign in with Chutes" OAuth for the Chutes provider`\n'
-            printf -- '- prevent daemon status probes from terminating IPython forkservers\n'
-            printf -- '- re-provision IPython after any unexpected kernel death\n\n'
+            printf -- '- re-provision the Python REPL after an unexpected kernel exit\n\n'
             printf 'The attached tarballs are byte-identical to the ones served from\n'
             printf '`%s/releases/%s/`.\n' "$BASE_URL" "$RELEASE_TAG"
           } > /tmp/release-notes.md
@@ -696,7 +690,7 @@ jobs:
           curl -fsSL --max-time 30 "${BASE_URL}/install.sh" -o /tmp/install.sh
           grep -q "$BASE_URL" /tmp/install.sh
 
-          # No TTY, so the installer auto-confirms. Skip the IPython runtime
+          # No TTY, so the installer auto-confirms. Skip the Python runtime
           # bootstrap: it pulls uv + Python and is not what we are verifying.
           # The version is resolved through the stable channel, exactly like a
           # real user's install.
