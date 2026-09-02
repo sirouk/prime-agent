@@ -388,6 +388,14 @@ export class IpythonKernelProvisioner {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
 		}
+		// An unexpectedly exited kernel leaves the settled promise memoized. Drop
+		// that dead handle so this call provisions a replacement instead of handing
+		// back a manager that can only reject with "Kernel has been shut down".
+		if (this.startedManager && !this.startedManager.isRunning) {
+			this.startedManager = undefined;
+			this.managerPromise = undefined;
+			this._lastRestore = undefined;
+		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
 			this.startupListeners.add(onProgress);
