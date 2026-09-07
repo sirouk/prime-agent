@@ -1,0 +1,269 @@
+name: Fork Sync (upstream -> chutes)
+
+# Keeps the fork's overlay branch sitting on top of upstream, then releases.
+#
+#   main    = upstream mirror + the single "fork ci" commit that carries these
+#             workflows. Updated by GitHub's "Sync fork" button, by the schedule
+#             below, or manually.
+#   chutes  = main + the Chutes provider/OAuth commits, rebased automatically.
+#
+# Clicking "Sync fork" on main pushes to main, which fires this workflow, which
+# rebases chutes onto the new main and cuts a release when the overlay moves.
+#
+# A push made with GITHUB_TOKEN does not trigger further workflows, so the
+# release is invoked directly as a reusable workflow rather than relying on the
+# push to chutes.
+#
+# Most overlay changes only add lines, so their recurring conflict is an addition
+# whose anchor upstream edited or deleted. That one case is settled automatically
+# by .github/scripts/resolve-overlay-conflicts.py. Every other conflict stops the
+# run and files an issue for human review.
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # 07:00 UTC daily, as a safety net if nobody clicks Sync fork.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_release:
+        description: 'Rebase the overlay branch but do not publish a release.'
+        required: false
+        default: false
+        type: boolean
+      skip_tests:
+        description: 'Skip all tests during the release build.'
+        required: false
+        default: false
+        type: boolean
+      full_tests:
+        description: 'Also run the slower coding-agent suite during the release build.'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  OVERLAY_BRANCH: chutes
+  UPSTREAM_REPO: https://github.com/PrimeIntellect-ai/prime-agent.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    name: Sync main and rebase the overlay
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      overlay_sha: ${{ steps.rebase.outputs.overlay_sha }}
+      rebased: ${{ steps.rebase.outputs.rebased }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: main
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Verify the conflict resolver
+        run: python3 .github/scripts/test-resolve-overlay-conflicts.py
+
+      - name: Merge upstream into main
+        id: upstream
+        run: |
+          set -eu
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
+          # Deliberately no --tags: upstream's moving "beta" tag collides with the
+          # fork's copy ("would clobber existing tag"), which makes fetch exit
+          # non-zero and kills the step under `set -e`. Release versions are
+          # derived from this fork's own v*-chutes.* tags, so upstream tags are
+          # not needed here.
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+          before=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "main already contains upstream/${UPSTREAM_BRANCH}."
+          elif git merge --no-edit -m "chore: sync main with upstream" "upstream/${UPSTREAM_BRANCH}"; then
+            echo "Merged upstream/${UPSTREAM_BRANCH} into main."
+          else
+            git merge --abort || true
+            echo "::error::Merging upstream/${UPSTREAM_BRANCH} into main conflicted. Resolve it manually."
+            exit 1
+          fi
+
+          after=$(git rev-parse HEAD)
+          if [ "$before" != "$after" ]; then
+            git push origin HEAD:main
+          fi
+          echo "main_sha=$after" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase the overlay branch onto main
+        id: rebase
+        run: |
+          set -eu
+          git fetch origin "$OVERLAY_BRANCH"
+          before=$(git rev-parse "origin/${OVERLAY_BRANCH}")
+
+          git checkout -B "$OVERLAY_BRANCH" "origin/${OVERLAY_BRANCH}"
+
+          if git merge-base --is-ancestor main HEAD; then
+            echo "Overlay already sits on the current main."
+            echo "rebased=false" >> "$GITHUB_OUTPUT"
+            echo "overlay_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # diff3 conflict markers expose the merge base, which the resolver below
+          # needs to tell "upstream deleted these lines" apart from "upstream
+          # rewrote them". Passed per-command rather than written to the repo
+          # config, which is not always writable (e.g. in a linked worktree); the
+          # resolver refuses outright if a base section is missing anyway.
+
+          # The resolver settles only a pure addition whose anchor upstream has
+          # since been deleted. All other conflict shapes remain conflicted.
+          # Each --continue can stop on the next commit, hence the loop; the
+          # bound is a backstop against a resolver that reports success without
+          # actually reducing the conflict set.
+          autoresolved=0
+          rc=0
+          git -c merge.conflictStyle=diff3 rebase main || rc=$?
+          while [ "$rc" -ne 0 ] && [ "$autoresolved" -lt 20 ]; do
+            if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+              echo "::error::Rebase stopped without conflicts; not something this step can settle."
+              break
+            fi
+            if ! python3 .github/scripts/resolve-overlay-conflicts.py; then
+              break
+            fi
+            autoresolved=$((autoresolved + 1))
+            rc=0
+            GIT_EDITOR=true git -c merge.conflictStyle=diff3 rebase --continue || rc=$?
+          done
+
+          if [ "$rc" -ne 0 ]; then
+            conflicts=$(git diff --name-only --diff-filter=U || true)
+            git rebase --abort || true
+            {
+              echo "conflict=true"
+              echo "rebased=false"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "CONFLICTS<<EOF"
+              echo "$conflicts"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+            echo "::error::Rebasing ${OVERLAY_BRANCH} onto main conflicted."
+            exit 1
+          fi
+
+          if [ "$autoresolved" -gt 0 ]; then
+            echo "::notice::Auto-resolved pure-insertion conflicts in ${autoresolved} step(s) of the rebase."
+          fi
+
+          # Most overlay commits are pure additions. The one reviewed exception is
+          # the README install-channel rewrite. Any deletion elsewhere means the
+          # rebase dropped upstream code, so fail before the push. The resolver
+          # remains pure-insertion-only; edits to upstream lines require review.
+          OVERLAY_MAY_MODIFY='README.md'
+          if git diff --numstat main HEAD |
+            awk -v allow="$OVERLAY_MAY_MODIFY" '
+              BEGIN { n = split(allow, list, " "); for (i = 1; i <= n; i++) exempt[list[i]] = 1 }
+              $2 != 0 && !($3 in exempt) { found = 1 }
+              END { exit !found }'; then
+            echo "::error::The rebased overlay deletes lines relative to main outside the exempt paths:"
+            git diff --numstat main HEAD |
+              awk -v allow="$OVERLAY_MAY_MODIFY" '
+                BEGIN { n = split(allow, list, " "); for (i = 1; i <= n; i++) exempt[list[i]] = 1 }
+                $2 != 0 && !($3 in exempt) { print "  " $3 " (-" $2 ")" }'
+            exit 1
+          fi
+
+          # Positive check on the one exempted rewrite: if a rebase ever puts
+          # upstream's install command back, the fork would ship a README telling
+          # people to install upstream's build.
+          if grep -q 'app\.primeintellect\.ai/prime-agent/install\.sh' README.md; then
+            echo "::error::README.md advertises upstream's installer again; the overlay's rewrite was lost in the rebase."
+            exit 1
+          fi
+
+          after=$(git rev-parse HEAD)
+          git push --force-with-lease="${OVERLAY_BRANCH}:${before}" origin "HEAD:${OVERLAY_BRANCH}"
+          {
+            echo "rebased=true"
+            echo "overlay_sha=$after"
+          } >> "$GITHUB_OUTPUT"
+          echo "Rebased ${OVERLAY_BRANCH}: ${before} -> ${after}"
+
+      # Best-effort: Issues are disabled on forks by default, and a failed
+      # notification must never mask the real failure above.
+      - name: Open an issue on conflict
+        if: failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          if ! gh api "repos/${GITHUB_REPOSITORY}" --jq .has_issues | grep -qx true; then
+            echo "::warning::Issues are disabled on this repository, so no conflict issue was filed." \
+              "Enable Settings -> General -> Features -> Issues to get notified here."
+            exit 0
+          fi
+          title="Fork sync failed: ${OVERLAY_BRANCH} needs a manual rebase"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number --jq '.[0].number' || true)
+
+          {
+            printf 'Automated sync of `%s` onto `main` failed.\n\n' "$OVERLAY_BRANCH"
+            printf '**Run:** %s/%s/actions/runs/%s\n\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf '**Conflicting paths:**\n\n```\n%s\n```\n\n' "${CONFLICTS:-see the run log}"
+            printf 'Auto-resolution already ran and declined these, so they are not the\n'
+            printf 'usual "overlay addition lost its anchor" case: upstream rewrote a region\n'
+            printf 'the overlay adds to, or the overlay itself changes an upstream line.\n'
+            printf 'Both need a human. Check the run log for which of the two it was.\n\n'
+            printf 'Resolve locally:\n\n'
+            printf '```sh\n'
+            printf 'git fetch origin\n'
+            printf 'git checkout -B %s origin/%s\n' "$OVERLAY_BRANCH" "$OVERLAY_BRANCH"
+            printf 'git rebase origin/main\n'
+            printf '# resolve conflicts, then:\n'
+            printf 'git push --force-with-lease origin %s\n' "$OVERLAY_BRANCH"
+            printf '```\n\n'
+            printf 'No release was published for this run.\n'
+          } > /tmp/issue-body.md
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file /tmp/issue-body.md
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file /tmp/issue-body.md
+          fi
+
+  release:
+    name: Release
+    needs: sync
+    if: ${{ inputs.skip_release != true && needs.sync.outputs.rebased == 'true' }}
+    uses: ./.github/workflows/fork-release.yml
+    # Must cover every permission the called workflow's jobs request, or the
+    # run fails at startup before any job is created.
+    permissions:
+      contents: write
+      pages: write
+    secrets: inherit
+    with:
+      ref: ${{ needs.sync.outputs.overlay_sha }}
+      skip_tests: ${{ inputs.skip_tests == true }}
+      full_tests: ${{ inputs.full_tests == true }}
