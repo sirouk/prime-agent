@@ -3,12 +3,20 @@ name: Fork Sync (upstream -> chutes)
 # Keeps the fork's overlay branch sitting on top of upstream, then releases.
 #
 #   main    = upstream mirror + the single "fork ci" commit that carries these
-#             workflows. Updated by GitHub's "Sync fork" button, by the schedule
-#             below, or manually.
+#             workflows. Updated by the hourly schedule below, by GitHub's
+#             "Sync fork" button, or manually.
 #   chutes  = main + the Chutes provider/OAuth commits, rebased automatically.
 #
-# Clicking "Sync fork" on main pushes to main, which fires this workflow, which
-# rebases chutes onto the new main and cuts a release when the overlay moves.
+# This runs itself: hourly, it asks GitHub for upstream's latest published
+# release, merges that tag into main, rebases chutes on top and cuts a release
+# when the overlay moves. Nothing needs to be clicked. A run with nothing to do
+# stops at "main already contains" in about fifteen seconds.
+#
+# It deliberately follows release tags rather than the tip of upstream's main:
+# tracking the tip would cut a fork release for every upstream commit, and those
+# builds would carry the last released version number anyway, since the version
+# comes from packages/coding-agent/package.json. Pass upstream_ref on a manual
+# run to sync something else (a specific tag, or "main" for the bleeding edge).
 #
 # A push made with GITHUB_TOKEN does not trigger further workflows, so the
 # release is invoked directly as a reusable workflow rather than relying on the
@@ -24,10 +32,16 @@ on:
     branches:
       - main
   schedule:
-    # 07:00 UTC daily, as a safety net if nobody clicks Sync fork.
-    - cron: '0 7 * * *'
+    # Hourly. This is the primary trigger: it is what makes the fork follow
+    # upstream's releases on its own, with no button to click. A run with
+    # nothing to do costs ~15s and stops at "main already contains".
+    - cron: '25 * * * *'
   workflow_dispatch:
     inputs:
+      upstream_ref:
+        description: "Upstream ref to sync, e.g. v0.9.3 or main. Blank follows upstream's latest release."
+        required: false
+        type: string
       skip_release:
         description: 'Rebase the overlay branch but do not publish a release.'
         required: false
@@ -54,7 +68,7 @@ permissions:
 env:
   OVERLAY_BRANCH: chutes
   UPSTREAM_REPO: https://github.com/PrimeIntellect-ai/prime-agent.git
-  UPSTREAM_BRANCH: main
+  UPSTREAM_SLUG: PrimeIntellect-ai/prime-agent
 
 jobs:
   sync:
@@ -83,26 +97,56 @@ jobs:
       - name: Verify the conflict resolver
         run: python3 .github/scripts/test-resolve-overlay-conflicts.py
 
+      - name: Resolve the upstream ref to sync
+        id: upstream_ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -eu
+          # Follow upstream's published releases rather than the tip of its main.
+          # main's tip is mid-cycle work: syncing it would cut a fork release for
+          # every upstream commit, and the version baked into those builds would
+          # be the last released one anyway. /releases/latest excludes
+          # prereleases, so upstream's rolling "beta" tag is ignored.
+          if [ -n "${REQUESTED_REF:-}" ]; then
+            ref="$REQUESTED_REF"
+            echo "Syncing the explicitly requested ref: ${ref}"
+          else
+            ref=$(gh api "repos/${UPSTREAM_SLUG}/releases/latest" --jq .tag_name)
+            if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+              echo "::error::Could not read the latest release of ${UPSTREAM_SLUG}."
+              exit 1
+            fi
+            echo "Latest upstream release: ${ref}"
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
       - name: Merge upstream into main
         id: upstream
+        env:
+          UPSTREAM_REF: ${{ steps.upstream_ref.outputs.ref }}
         run: |
           set -eu
           git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
           # Deliberately no --tags: upstream's moving "beta" tag collides with the
           # fork's copy ("would clobber existing tag"), which makes fetch exit
-          # non-zero and kills the step under `set -e`. Release versions are
-          # derived from this fork's own v*-chutes.* tags, so upstream tags are
+          # non-zero and kills the step under `set -e`. Fetching the single ref we
+          # were asked for avoids that entirely. Release versions are derived from
+          # this fork's own v*-chutes.* tags, so the rest of upstream's tags are
           # not needed here.
-          git fetch upstream "$UPSTREAM_BRANCH"
+          git fetch upstream "$UPSTREAM_REF"
+          # ^{commit} because an annotated tag resolves to the tag object first.
+          target=$(git rev-parse "FETCH_HEAD^{commit}")
 
           before=$(git rev-parse HEAD)
-          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
-            echo "main already contains upstream/${UPSTREAM_BRANCH}."
-          elif git merge --no-edit -m "chore: sync main with upstream" "upstream/${UPSTREAM_BRANCH}"; then
-            echo "Merged upstream/${UPSTREAM_BRANCH} into main."
+          if git merge-base --is-ancestor "$target" HEAD; then
+            echo "main already contains ${UPSTREAM_REF}."
+          elif git merge --no-edit -m "chore: sync main with upstream ${UPSTREAM_REF}" "$target"; then
+            echo "Merged ${UPSTREAM_REF} into main."
           else
             git merge --abort || true
-            echo "::error::Merging upstream/${UPSTREAM_BRANCH} into main conflicted. Resolve it manually."
+            echo "::error::Merging ${UPSTREAM_REF} into main conflicted. Resolve it manually."
             exit 1
           fi
 

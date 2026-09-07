@@ -8,27 +8,37 @@ automatic.
 
 | Branch          | What it is                                                                 |
 | --------------- | -------------------------------------------------------------------------- |
-| `main`          | Upstream `PrimeIntellect-ai/prime-agent@main`, plus fork-maintenance workflows and documentation. Safe to update with GitHub's **Sync fork** button. |
+| `main`          | Upstream's latest **released** tag, plus fork-maintenance workflows and documentation. Advanced automatically; you do not need to touch it. |
 | `chutes`        | `main` plus the Chutes provider/OAuth, installer-doc, and REPL-recovery overlay commits. **Rebased and force-pushed by CI** — never commit anything here that you are not willing to see replayed. |
 | `gh-pages`      | The published release site. Written only by CI. |
 | `chutes-provider` | Untouched import of `chutesai/prime-agent@chutes-provider`, kept for provenance. Not maintained. |
 | `chutes-oauth`  | Untouched import of `fstandhartinger/prime-agent@chutes-oauth`, kept for provenance. Not maintained. |
 
-## What happens when you click "Sync fork"
+## How a fork release gets cut
 
-1. GitHub pushes upstream's commits onto `main`.
-2. That push fires [`fork-sync.yml`](../.github/workflows/fork-sync.yml), which:
-   - merges `upstream/main` into `main` (a no-op if the button already did it),
+This is automatic. Nothing needs to be clicked.
+
+1. Hourly, [`fork-sync.yml`](../.github/workflows/fork-sync.yml) asks GitHub for
+   upstream's latest published release and:
+   - merges that tag into `main`,
    - rebases `chutes` onto the new `main` and force-pushes it,
    - calls [`fork-release.yml`](../.github/workflows/fork-release.yml).
-3. The release workflow builds, packs, publishes to GitHub Pages, mirrors the
+2. The release workflow builds, packs, publishes to GitHub Pages, mirrors the
    artifacts to a GitHub Release, and then **installs the result from the
    published URL** to prove the installer works.
 
-A release is cut on every sync, even when nothing changed.
+When upstream has not released anything new, step 1 stops at
+`main already contains ...` in about fifteen seconds and no release is cut.
 
-The same run also happens daily at 07:00 UTC as a safety net, and can be started
-by hand from the Actions tab.
+It follows release *tags*, not the tip of upstream's `main`, so mid-cycle
+upstream commits do not each produce a fork release. To sync something else,
+run the workflow by hand from the Actions tab and set `upstream_ref` (a tag, or
+`main` for the bleeding edge).
+
+> **Avoid GitHub's "Sync fork" button.** `main` carries the fork's CI commit, so
+> it always counts as diverged, and the button offers to *discard* that commit —
+> which deletes these workflows and silently stops all releases. The hourly sync
+> already does the job.
 
 ### If the rebase conflicts
 
@@ -75,9 +85,9 @@ Result: released builds check `https://sirouk.github.io/prime-agent/latest.json`
 `/update` installs this fork's tarball, and `-chutes.N` increments are seen as
 updates while upstream releases are not.
 
-You still learn about upstream releases — the daily sync rebases onto them and
+You still learn about upstream releases — the hourly sync rebases onto them and
 cuts a new `-chutes.N` automatically, so an upstream release becomes a fork
-release (and a new GitHub Release entry) within a day.
+release (and a new GitHub Release entry) within the hour.
 
 To temporarily point an installed build somewhere else without rebuilding:
 
@@ -147,7 +157,7 @@ human-visible download page.
 - **Settings → Actions → General → Workflow permissions**: *Read and write
   permissions*, and allow Actions to create pull requests is not required.
 - **Actions must be enabled** — forks start with workflows disabled, so the
-  "Sync fork" push will not trigger anything until you enable them once.
+  hourly sync will not run at all until you enable them once.
 - Optional: set a repository variable `PAGES_BASE_URL` to override the derived
   `https://<owner>.github.io/<repo>` base (e.g. for a custom domain).
 
