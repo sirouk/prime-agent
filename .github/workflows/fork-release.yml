@@ -584,15 +584,20 @@ jobs:
           echo "Requested a Pages build for $SITE_SHA from ${PAGES_BRANCH} at the site root."
 
           for attempt in $(seq 1 60); do
-            build=$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest")
-            build_status=$(printf '%s' "$build" | jq -r '.status // ""')
-            build_commit=$(printf '%s' "$build" | jq -r '.commit // ""')
-            echo "Attempt $attempt: Pages build $build_commit is $build_status."
-            if [ "$build_commit" = "$SITE_SHA" ] && [ "$build_status" = "built" ]; then
+            # The gh-pages push can start its own Pages build on top of the one
+            # requested above, and the loser of that race reports "errored"
+            # ("Page build failed") while the winner succeeds. Judge completion
+            # by every build of this commit, not by whichever one is /latest.
+            counts=$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds" \
+              | jq -r --arg sha "$SITE_SHA" \
+                '[.[] | select(.commit == $sha) | .status] | [([.[] | select(. == "built")] | length), ([.[] | select(. != "built" and . != "errored")] | length), ([.[] | select(. == "errored")] | length)] | join(" ")')
+            read -r built pending errored <<< "$counts"
+            echo "Attempt $attempt: Pages builds of $SITE_SHA -> built=$built pending=$pending errored=$errored."
+            if [ "$built" -gt 0 ]; then
               exit 0
             fi
-            if [ "$build_commit" = "$SITE_SHA" ] && [ "$build_status" = "errored" ]; then
-              printf '%s' "$build" | jq -r '.error.message // "Pages build failed"' >&2
+            if [ "$pending" -eq 0 ] && [ "$errored" -gt 0 ]; then
+              echo "::error::All $errored Pages build(s) of $SITE_SHA errored." >&2
               exit 1
             fi
             sleep 10

@@ -17,6 +17,7 @@
 		"check": "biome check --write --error-on-warnings . && tsgo --noEmit && npm run check:installer && npm run check:browser-smoke",
 		"check:installer": "node scripts/check-installer.mjs",
 		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
+		"check:fork-release": "node scripts/check-fork-release.mjs",
 		"profile:tui": "node scripts/profile-coding-agent-node.mjs --mode tui",
 		"profile:rpc": "node scripts/profile-coding-agent-node.mjs --mode rpc",
 		"test": "npm run test --workspaces --if-present",

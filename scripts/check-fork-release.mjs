@@ -295,8 +295,9 @@ try {
 		"Pages step does not explicitly request a build",
 	);
 	assert(
-		pagesStep.includes('[ "$build_commit" = "$SITE_SHA" ]'),
-		"Pages step does not bind completion to the pushed site commit",
+		pagesStep.includes('select(.commit == $sha)') &&
+			pagesStep.includes('[ "$built" -gt 0 ]'),
+		"Pages step does not bind completion to a built Pages build of the pushed site commit",
 	);
 	assert(
 		syncWorkflowSource.includes(
