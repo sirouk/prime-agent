@@ -9,7 +9,7 @@ automatic.
 | Branch          | What it is                                                                 |
 | --------------- | -------------------------------------------------------------------------- |
 | `main`          | Upstream's latest **released** tag, plus fork-maintenance workflows and documentation. Advanced automatically; you do not need to touch it. |
-| `chutes`        | `main` plus the Chutes provider/OAuth, installer-doc, and REPL-recovery overlay commits. **Rebased and force-pushed by CI** — never commit anything here that you are not willing to see replayed. |
+| `chutes`        | `main` plus the Chutes provider/OAuth and installer-doc overlay commits. **Rebased and force-pushed by CI** — never commit anything here that you are not willing to see replayed. |
 | `gh-pages`      | The published release site. Written only by CI. |
 | `chutes-provider` | Untouched import of `chutesai/prime-agent@chutes-provider`, kept for provenance. Not maintained. |
 | `chutes-oauth`  | Untouched import of `fstandhartinger/prime-agent@chutes-oauth`, kept for provenance. Not maintained. |
@@ -61,11 +61,13 @@ Upstream inserts new version headers at the top of that file on every release,
 which made it the only recurring conflict. The Chutes changes are described in
 the generated GitHub Release notes instead.
 
-The small runtime overlay re-provisions the Python REPL after an unexpected
-kernel process exit. It adds no deletion exception to `fork-sync.yml`: a future
-runtime rewrite stops for manual review instead of silently carrying old kernel
-code forward. Every release runs the focused provisioner regression before
-packaging.
+The old runtime overlay that re-provisioned the Python REPL after an
+unexpected kernel process exit was dropped at the v0.9.4 sync: upstream shipped
+its own recovery (a terminally dead kernel drops the memoized handle via
+`isDefunct`; a repairing manager recovers itself). It was deliberately narrower
+than ours, so the sync's conflict was the stop-for-manual-review case working
+as designed. The focused `ipython-provisioner.test.ts` regression still runs
+before packaging — it now guards upstream's implementation of the fix.
 
 ## The update channel
 
