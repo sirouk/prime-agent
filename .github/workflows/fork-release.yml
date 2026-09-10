@@ -99,6 +99,7 @@ jobs:
       - name: Resolve version and base URL
         id: resolve
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_REF: ${{ inputs.ref || github.ref_name }}
           INPUT_VERSION: ${{ inputs.version }}
           PAGES_BASE_URL: ${{ vars.PAGES_BASE_URL }}
@@ -112,8 +113,18 @@ jobs:
           if [ -n "$requested" ]; then
             release_version="$requested"
           else
+            # Both a git tag and an already-staged site directory make a version
+            # immutable: a run that dies between site publish and tagging (the
+            # v0.9.4-chutes.1 incident) leaves an untagged directory whose
+            # checksums must not be replaced, so the next run rolls forward
+            # instead of colliding and requiring a manual dispatch.
+            used_names=$( {
+              git tag --list "v${upstream_version}-chutes.*"
+              gh api "repos/${GITHUB_REPOSITORY}/contents/releases?ref=${PAGES_BRANCH:-gh-pages}" 2>/dev/null \
+                | jq -r '.[].name'
+            } )
             n=1
-            while git rev-parse -q --verify "refs/tags/v${upstream_version}-chutes.${n}" >/dev/null 2>&1; do
+            while printf '%s\n' "$used_names" | grep -qxF "v${upstream_version}-chutes.${n}"; do
               n=$((n + 1))
             done
             release_version="${upstream_version}-chutes.${n}"

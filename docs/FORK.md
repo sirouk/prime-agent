@@ -102,8 +102,10 @@ export PRIME_AGENT_DOWNLOAD_BASE_URL=https://sirouk.github.io/prime-agent
 ## Versioning
 
 Releases are versioned `<upstream-version>-chutes.<N>`, e.g. `0.7.2-chutes.1`.
-`N` is derived by scanning existing tags, so re-running the workflow produces a
-new version rather than clobbering one. Both `install.sh` and
+`N` is derived by scanning both existing tags and already-staged site
+directories, so re-running the workflow produces a new version rather than
+clobbering one — including after a run that died between publishing the site
+and tagging it. Both `install.sh` and
 `scripts/pack-prime-agent-release.mjs` accept `[0-9A-Za-z.-]`, so the suffix is
 safe.
 
