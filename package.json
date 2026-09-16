@@ -1,0 +1,24 @@
+{
+  "name": "prime-agent-chutes",
+  "version": "1.0.0",
+  "description": "Chutes provider for Prime Agent: live model catalog and Sign in with Chutes",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test --test-timeout=10000 test/*.test.ts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/releases/v0.9.5/prime-agent-0.9.5.tgz",
+    "@types/node": "^22.18.0",
+    "typescript": "~5.9.2"
+  }
+}
