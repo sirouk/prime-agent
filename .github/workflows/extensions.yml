@@ -1,6 +1,6 @@
-name: Chutes extension
+name: Extensions
 
-# Tests the Chutes and endpoints extensions against Prime Agent's latest release,
+# Tests the endpoints and Chutes extensions against Prime Agent's latest release,
 # both the npm build and the compiled binary, then publishes the installer and
 # extensions to GitHub Pages. The daily run catches a Prime Agent release that
 # breaks an extension; GitHub only runs schedules on the default branch.
@@ -8,10 +8,10 @@ name: Chutes extension
 on:
   push:
     branches:
-      - chutes-extension
+      - extensions
   pull_request:
     branches:
-      - chutes-extension
+      - extensions
   schedule:
     - cron: '41 6 * * *'
   workflow_dispatch:
@@ -116,19 +116,28 @@ jobs:
           site="$RUNNER_TEMP/site"
           home="$RUNNER_TEMP/home"
           mkdir -p "$site/extensions" "$home"
-          cp extensions/chutes.ts "$site/extensions/"
-          (cd "$site/extensions" && sha256sum chutes.ts > SHA256SUMS)
+          cp extensions/endpoints.ts extensions/chutes.ts "$site/extensions/"
+          (cd "$site/extensions" && sha256sum endpoints.ts chutes.ts > SHA256SUMS)
           python3 -m http.server 8765 --bind 127.0.0.1 --directory "$site" >/dev/null 2>&1 &
           sleep 1
-          env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
-            PRIME_AGENT_CHUTES_BASE_URL=http://127.0.0.1:8765 \
-            PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 \
-            PRIME_AGENT_INSTALLER_PLAIN=1 PRIME_AGENT_SHELL_PROFILE="$home/.profile" \
-            sh install.sh </dev/null
+          run_installer() {
+            env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+              PRIME_AGENT_EXTENSIONS_BASE_URL=http://127.0.0.1:8765 \
+              PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 \
+              PRIME_AGENT_INSTALLER_PLAIN=1 PRIME_AGENT_SHELL_PROFILE="$home/.profile" \
+              "$@" sh install.sh </dev/null
+          }
+
+          # By default: Prime Agent and the endpoints extension.
+          run_installer
+          env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" PI_SKIP_VERSION_CHECK=1 \
+            "$home/.local/bin/prime-agent" --version </dev/null
+          cmp extensions/endpoints.ts "$home/.prime/agent/extensions/endpoints.ts"
+          test ! -e "$home/.prime/agent/extensions/chutes.ts"
+
+          # Asked for Chutes: it is added.
+          run_installer PRIME_AGENT_WITH_CHUTES=1
           cmp extensions/chutes.ts "$home/.prime/agent/extensions/chutes.ts"
-          env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" PI_SKIP_VERSION_CHECK=1 CHUTES_API_KEY=cpk_ci \
-            "$home/.local/bin/prime-agent" model list chutes </dev/null 2>&1 | tee "$RUNNER_TEMP/models.txt"
-          grep -q '^chutes ' "$RUNNER_TEMP/models.txt"
 
   publish:
     name: Publish to GitHub Pages
