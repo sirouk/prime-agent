@@ -1,0 +1,198 @@
+name: Chutes extension
+
+# Tests the extension against Prime Agent's latest release, both the npm build
+# and the compiled binary, then publishes the installer and extension to GitHub
+# Pages. The daily run catches a Prime Agent release that breaks the extension;
+# GitHub only runs schedules on the default branch.
+
+on:
+  push:
+    branches:
+      - chutes-extension
+  pull_request:
+    branches:
+      - chutes-extension
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Find Prime Agent's latest release
+    runs-on: ubuntu-latest
+    outputs:
+      base_url: ${{ steps.find.outputs.base_url }}
+      version: ${{ steps.find.outputs.version }}
+    steps:
+      - name: Read the release channel from Prime Agent's installer
+        id: find
+        run: |
+          set -eu
+          # The pattern matches the installer's literal ${PRIME_AGENT_DOWNLOAD_BASE_URL:-...} line.
+          # shellcheck disable=SC2016
+          base_url=$(curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh |
+            sed -n 's/^prime_agent_base_url="\${PRIME_AGENT_DOWNLOAD_BASE_URL:-\(.*\)}"$/\1/p')
+          version=$(curl -fsSL "$base_url/stable")
+          version=${version#v}
+          if [ -z "$base_url" ] || [ -z "$version" ]; then
+            echo "::error::Could not read Prime Agent's release channel from its installer."
+            exit 1
+          fi
+          echo "base_url=$base_url" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Prime Agent $version from $base_url"
+
+  test:
+    name: Test on Prime Agent ${{ needs.release.outputs.version }} (${{ matrix.install }})
+    needs: release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        install: [npm, binary]
+    env:
+      BASE_URL: ${{ needs.release.outputs.base_url }}
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 22
+
+      - name: Install dependencies, using this Prime Agent release for types
+        run: |
+          set -eu
+          npm install --no-audit --no-fund
+          npm install --no-audit --no-fund --no-save \
+            "@earendil-works/pi-coding-agent@$BASE_URL/releases/v$VERSION/prime-agent-$VERSION.tgz"
+
+      - name: Typecheck
+        run: npm run check
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Install Prime Agent (${{ matrix.install }})
+        id: agent
+        env:
+          INSTALL: ${{ matrix.install }}
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/prime-agent"
+          mkdir -p "$dir"
+          if [ "$INSTALL" = npm ]; then
+            npm install --global --prefix "$dir" --no-audit --no-fund "$BASE_URL/releases/v$VERSION/prime-agent-$VERSION.tgz"
+            echo "bin=$dir/bin/prime-agent" >> "$GITHUB_OUTPUT"
+          else
+            archive="prime-agent-$VERSION-linux-x64.tar.gz"
+            cd "$dir"
+            curl -fsSLO "$BASE_URL/releases/v$VERSION/$archive"
+            curl -fsSL "$BASE_URL/releases/v$VERSION/SHA256SUMS" | grep " $archive\$" | sha256sum -c -
+            tar -xzf "$archive"
+            echo "bin=$dir/prime-agent" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: End-to-end tests
+        run: test/e2e.sh "${{ steps.agent.outputs.bin }}"
+
+  installer:
+    name: Test the installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install into a clean home from a local copy of the site
+        run: |
+          set -eu
+          site="$RUNNER_TEMP/site"
+          home="$RUNNER_TEMP/home"
+          mkdir -p "$site/extensions" "$home"
+          cp extensions/chutes.ts "$site/extensions/"
+          (cd "$site/extensions" && sha256sum chutes.ts > SHA256SUMS)
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$site" >/dev/null 2>&1 &
+          sleep 1
+          env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+            PRIME_AGENT_CHUTES_BASE_URL=http://127.0.0.1:8765 \
+            PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 \
+            PRIME_AGENT_INSTALLER_PLAIN=1 PRIME_AGENT_SHELL_PROFILE="$home/.profile" \
+            sh install.sh </dev/null
+          cmp extensions/chutes.ts "$home/.prime/agent/extensions/chutes.ts"
+          env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" PI_SKIP_VERSION_CHECK=1 CHUTES_API_KEY=cpk_ci \
+            "$home/.local/bin/prime-agent" model list chutes </dev/null 2>&1 | tee "$RUNNER_TEMP/models.txt"
+          grep -q '^chutes ' "$RUNNER_TEMP/models.txt"
+
+  publish:
+    name: Publish to GitHub Pages
+    needs: [test, installer]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          ref: gh-pages
+          path: site
+
+      - name: Stage the installer, extension and landing page
+        run: |
+          set -eu
+          cp install.sh site/install.sh
+          # The former beta installer URL gets the same setup.
+          cp install.sh site/install-beta.sh
+          cp pages/index.md site/index.md
+          mkdir -p site/extensions
+          cp extensions/chutes.ts site/extensions/chutes.ts
+          (cd site/extensions && sha256sum chutes.ts > SHA256SUMS)
+
+      - name: Commit and push the site
+        id: site
+        working-directory: site
+        run: |
+          set -eu
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add install.sh install-beta.sh index.md extensions
+          if git diff --cached --quiet; then
+            echo "The site already serves this version."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "publish the chutes extension from ${GITHUB_SHA::12}"
+          git push origin HEAD:gh-pages
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Request a Pages build
+        if: steps.site.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Pushes made with GITHUB_TOKEN do not start a Pages build on their own.
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null
+
+      - name: Wait for the site to serve this extension
+        run: |
+          set -eu
+          owner=$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+          url="https://$owner.github.io/${GITHUB_REPOSITORY#*/}/extensions/SHA256SUMS"
+          expected="$(sha256sum extensions/chutes.ts | cut -d ' ' -f 1)  chutes.ts"
+          for attempt in $(seq 60); do
+            # A unique query string skips the CDN's cached copy.
+            if [ "$(curl -fsSL "$url?check=$GITHUB_RUN_ID-$attempt" 2>/dev/null || true)" = "$expected" ]; then
+              echo "Published: $url"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::$url did not serve the new extension within 20 minutes."
+          exit 1
