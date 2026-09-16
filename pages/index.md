@@ -8,4 +8,6 @@ This installs [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) fr
 
 Then start `prime-agent`, run `/login` and choose **Chutes (Sign in with Chutes)**, or set `CHUTES_API_KEY`. Chutes models are listed under `/model`.
 
+Also available: an extension for adding your own OpenAI-compatible endpoints with API keys and switching between them, described in the README linked below.
+
 Source and details: [sirouk/prime-agent, `chutes-extension` branch](https://github.com/sirouk/prime-agent/tree/chutes-extension).
