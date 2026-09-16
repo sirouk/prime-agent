@@ -1,9 +1,9 @@
 name: Chutes extension
 
-# Tests the extension against Prime Agent's latest release, both the npm build
-# and the compiled binary, then publishes the installer and extension to GitHub
-# Pages. The daily run catches a Prime Agent release that breaks the extension;
-# GitHub only runs schedules on the default branch.
+# Tests the Chutes and endpoints extensions against Prime Agent's latest release,
+# both the npm build and the compiled binary, then publishes the installer and
+# extensions to GitHub Pages. The daily run catches a Prime Agent release that
+# breaks an extension; GitHub only runs schedules on the default branch.
 
 on:
   push:
@@ -97,7 +97,12 @@ jobs:
           fi
 
       - name: End-to-end tests
-        run: test/e2e.sh "${{ steps.agent.outputs.bin }}"
+        env:
+          AGENT_BIN: ${{ steps.agent.outputs.bin }}
+        run: |
+          set -eu
+          test/e2e-chutes.sh "$AGENT_BIN"
+          test/e2e-endpoints.sh "$AGENT_BIN"
 
   installer:
     name: Test the installer
@@ -152,8 +157,8 @@ jobs:
           cp install.sh site/install-beta.sh
           cp pages/index.md site/index.md
           mkdir -p site/extensions
-          cp extensions/chutes.ts site/extensions/chutes.ts
-          (cd site/extensions && sha256sum chutes.ts > SHA256SUMS)
+          cp extensions/chutes.ts extensions/endpoints.ts site/extensions/
+          (cd site/extensions && sha256sum chutes.ts endpoints.ts > SHA256SUMS)
 
       - name: Commit and push the site
         id: site
@@ -180,12 +185,12 @@ jobs:
           # Pushes made with GITHUB_TOKEN do not start a Pages build on their own.
           gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null
 
-      - name: Wait for the site to serve this extension
+      - name: Wait for the site to serve these extensions
         run: |
           set -eu
           owner=$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
           url="https://$owner.github.io/${GITHUB_REPOSITORY#*/}/extensions/SHA256SUMS"
-          expected="$(sha256sum extensions/chutes.ts | cut -d ' ' -f 1)  chutes.ts"
+          expected=$(cd extensions && sha256sum chutes.ts endpoints.ts)
           for attempt in $(seq 60); do
             # A unique query string skips the CDN's cached copy.
             if [ "$(curl -fsSL "$url?check=$GITHUB_RUN_ID-$attempt" 2>/dev/null || true)" = "$expected" ]; then
@@ -194,5 +199,5 @@ jobs:
             fi
             sleep 20
           done
-          echo "::error::$url did not serve the new extension within 20 minutes."
+          echo "::error::$url did not serve the new extensions within 20 minutes."
           exit 1
