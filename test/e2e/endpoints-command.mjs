@@ -1,6 +1,6 @@
 // Drives /endpoints through `prime-agent --mode rpc`, answering its dialogs the way
-// a user would: add an endpoint, switch to one of its models, chat through it,
-// disable and enable it, then remove it from the menu. Run it inside the suite's
+// a user would: add an endpoint, take the handoff to Prime Agent's model picker,
+// switch there, chat through it, disable and enable it, then remove it from the menu. Run it inside the suite's
 // isolated environment. The endpoint must list models m1 and m2 and accept the
 // key sk-e2e; the config must already hold a "seed" endpoint with "seed-model",
 // which the session starts on.
@@ -85,6 +85,11 @@ async function answer(method, title, reply) {
 	return dialog;
 }
 
+/** The editor text an extension leaves for the user, e.g. a `/model` command. */
+function editorText(text) {
+	return waitFor(`the editor text "${text}"`, (m) => m.type === "extension_ui_request" && m.method === "set_editor_text" && m.text === text);
+}
+
 function notice(message) {
 	return waitFor(`the notice "${message}"`, (m) => m.type === "extension_ui_request" && m.method === "notify" && m.message.startsWith(message));
 }
@@ -96,27 +101,34 @@ function check(condition, reason) {
 const commands = await request("get_commands");
 check(commands.commands.some((command) => command.name === "endpoints"), "/endpoints is not registered");
 
-// Add an endpoint, then switch to one of its models.
+// Add an endpoint; it leaves `/model gpu-box` for Prime Agent's picker.
 send({ type: "prompt", message: "/endpoints add" });
 await answer("input", "Endpoint URL", { value: baseUrl });
 await answer("input", "API key", { value: "sk-e2e" });
 await answer("input", "Name", { value: "GPU Box" });
-await notice("Added GPU Box with 2 models.");
-await answer("confirm", "Use GPU Box?", { confirmed: true });
-const picker = await answer("select", "Model on GPU Box", { value: "m2" });
-check(JSON.stringify(picker.options) === JSON.stringify(["m1", "m2"]), `unexpected models: ${JSON.stringify(picker.options)}`);
-await notice("Now using m2 on GPU Box.");
+await editorText("/model gpu-box");
+await notice("Added GPU Box with 2 models. Press Enter to choose one.");
+// RPC has no picker; set_model is the command the picker's choice runs.
+await request("set_model", { provider: "gpu-box", modelId: "m2" });
 const state = await request("get_state");
 check(state.model?.provider === "gpu-box" && state.model?.id === "m2", `model is ${state.model?.provider}/${state.model?.id}`);
 const saved = JSON.parse(readFileSync(join(agentDir, "endpoints.json"), "utf8")).endpoints;
 check(saved.some((e) => e.id === "gpu-box" && e.baseUrl === baseUrl && e.enabled === true), "the endpoint was not saved");
 check(JSON.parse(readFileSync(join(agentDir, "auth.json"), "utf8"))["gpu-box"]?.key === "sk-e2e", "the key was not saved");
-console.log("ok   adds an endpoint and switches to one of its models");
+console.log("ok   adds an endpoint and hands model choice to Prime Agent's picker");
 
 // Chat through the endpoint that was just added.
 send({ type: "prompt", message: "Reply with pong" });
 await waitFor("the end of the reply", (m) => m.type === "agent_end");
 console.log("ok   chats through the endpoint's model");
+
+// The menu hands off to the picker too.
+send({ type: "prompt", message: "/endpoints" });
+await answer("select", "Endpoints", (dialog) => ({ value: dialog.options.find((option) => option.startsWith("GPU Box [gpu-box]")) }));
+await answer("select", "GPU Box [gpu-box]", { value: "Choose one of its models" });
+await editorText("/model gpu-box");
+await notice("Press Enter to choose one of GPU Box's models.");
+console.log("ok   offers the picker for an endpoint from the menu");
 
 // Disable hides its models; enabling brings them back.
 const models = async () => (await request("get_available_models")).models.filter((m) => m.provider === "gpu-box").map((m) => m.id);

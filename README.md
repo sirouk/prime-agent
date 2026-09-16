@@ -64,10 +64,10 @@ curl -fsSL https://sirouk.github.io/prime-agent/extensions/endpoints.ts -o ~/.pr
 
 Then run `/endpoints` in Prime Agent:
 
-- **Add an endpoint**: enter its URL (usually ending in `/v1`), its API key (leave it empty if the endpoint needs none) and a name. The endpoint is checked by listing its models, then saved, and you can switch to one of its models right away.
-- **Pick an endpoint** to use one of its models, disable or enable it, refresh its models, change its API key or URL, or remove it. A disabled endpoint keeps its settings and key, but its models are hidden.
+- **Add an endpoint**: enter its URL (usually ending in `/v1`), its API key (leave it empty if the endpoint needs none) and a name. The endpoint is checked by listing its models and saved. `/model <id>` is then left in the input line: press Enter to choose one of its models in Prime Agent's model picker.
+- **Pick an endpoint** to choose one of its models (again through the model picker), disable or enable it, refresh its models, change its API key or URL, or remove it. A disabled endpoint keeps its settings and key, but its models are hidden.
 
-Shortcuts take the id shown in brackets in the list: `/endpoints add`, `/endpoints use <id>`, `/endpoints enable <id>`, `/endpoints disable <id>`, `/endpoints refresh <id>`, `/endpoints remove <id>`.
+Endpoint models are ordinary Prime Agent models, so `/model` lists them next to all the others, and `/model <id>` searches for one endpoint's models. Shortcuts take the id shown in brackets in the `/endpoints` list: `/endpoints add`, `/endpoints enable <id>`, `/endpoints disable <id>`, `/endpoints refresh <id>`, `/endpoints remove <id>`.
 
 Endpoints are saved in `~/.prime/agent/endpoints.json`, which you can also edit by hand. API keys are saved in Prime Agent's credential store, so `/login` and `/logout` work for these endpoints too. A key can also come from an environment variable named after the id: `TOGETHER_API_KEY` for `together`, `MY_GPU_API_KEY` for `my-gpu`. With no key at all, the endpoint's models are still listed and requests fail with an authentication error until you add one.
 

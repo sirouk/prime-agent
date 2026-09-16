@@ -3,8 +3,9 @@
  *
  * `/endpoints` adds any OpenAI-compatible endpoint that takes an API key, such as
  * a hosted provider, a gateway, or a self-hosted vLLM, Ollama or LM Studio
- * server, and manages the ones you added: switch to one of their models, enable
- * or disable them, change the key or URL, refresh their models, remove them.
+ * server, and manages the ones you added: enable or disable them, change the key
+ * or URL, refresh their models, remove them. Their models are chosen in Prime
+ * Agent's own model picker.
  *
  * - Endpoints are saved in `endpoints.json` in Prime Agent's config directory.
  *   Their API keys go to Prime Agent's credential store, so `/login` and
@@ -289,7 +290,7 @@ async function refreshModels(pi: ExtensionAPI, ctx: ExtensionContext, endpoint: 
 // The /endpoints command
 // ---------------------------------------------------------------------------
 
-const USAGE = "Usage: /endpoints [add | use <id> | enable <id> | disable <id> | refresh <id> | remove <id>]";
+const USAGE = "Usage: /endpoints [add | enable <id> | disable <id> | refresh <id> | remove <id>]";
 
 function modelsOf(ctx: ExtensionContext, id: string) {
 	return ctx.modelRegistry.getAll().filter((model) => model.provider === id);
@@ -365,30 +366,22 @@ async function addEndpoint(pi: ExtensionAPI, ctx: ExtensionCommandContext): Prom
 	register(pi, endpoint, entries);
 
 	const count = modelsOf(ctx, id).length;
-	ctx.ui.notify(`Added ${name} with ${count} models.`, "info");
-	if (count > 0 && (await ctx.ui.confirm(`Use ${name}?`, "Pick one of its models now."))) {
-		await useEndpoint(pi, ctx, endpoint);
+	if (count === 0) {
+		ctx.ui.notify(`Added ${name}, but it lists no models the agent can use.`, "warning");
+		return;
 	}
+	openModelPicker(ctx, endpoint, `Added ${name} with ${count} models. Press Enter to choose one.`);
 }
 
-async function useEndpoint(pi: ExtensionAPI, ctx: ExtensionCommandContext, endpoint: Endpoint): Promise<void> {
-	if (!endpoint.enabled) {
-		ctx.ui.notify(`${endpoint.name} is disabled; enable it first.`, "warning");
-		return;
-	}
-	const models = modelsOf(ctx, endpoint.id);
-	if (models.length === 0) {
-		ctx.ui.notify(`${endpoint.name} has no models yet; refresh it.`, "warning");
-		return;
-	}
-	const choice = await ctx.ui.select(`Model on ${endpoint.name}`, models.map((model) => model.id));
-	const model = choice === undefined ? undefined : models.find((candidate) => candidate.id === choice);
-	if (!model) return;
-	if (await pi.setModel(model)) {
-		ctx.ui.notify(`Now using ${model.id} on ${endpoint.name}.`, "info");
-	} else {
-		ctx.ui.notify(`${endpoint.name} has no API key. Set one with /endpoints.`, "warning");
-	}
+/**
+ * Leaves `/model <id>` in the editor, so Enter opens Prime Agent's model picker
+ * searched to this endpoint. Extensions cannot open the picker themselves, and
+ * switching there, rather than with pi.setModel, keeps Prime Agent's display of
+ * the current model up to date.
+ */
+function openModelPicker(ctx: ExtensionCommandContext, endpoint: Endpoint, message: string): void {
+	ctx.ui.setEditorText(`/model ${endpoint.id}`);
+	ctx.ui.notify(message, "info");
 }
 
 async function setEnabled(pi: ExtensionAPI, ctx: ExtensionCommandContext, endpoint: Endpoint, enabled: boolean): Promise<void> {
@@ -455,8 +448,12 @@ async function removeEndpoint(pi: ExtensionAPI, ctx: ExtensionCommandContext, en
 }
 
 async function manageEndpoint(pi: ExtensionAPI, ctx: ExtensionCommandContext, endpoint: Endpoint): Promise<void> {
-	const actions = new Map<string, () => Promise<void>>();
-	if (endpoint.enabled) actions.set("Use one of its models", () => useEndpoint(pi, ctx, endpoint));
+	const actions = new Map<string, () => Promise<void> | void>();
+	if (endpoint.enabled && modelsOf(ctx, endpoint.id).length > 0) {
+		actions.set("Choose one of its models", () =>
+			openModelPicker(ctx, endpoint, `Press Enter to choose one of ${endpoint.name}'s models.`),
+		);
+	}
 	actions.set(endpoint.enabled ? "Disable" : "Enable", () => setEnabled(pi, ctx, endpoint, !endpoint.enabled));
 	actions.set("Refresh models", () => refreshEndpoint(pi, ctx, endpoint));
 	actions.set("Change API key", () => changeKey(pi, ctx, endpoint));
@@ -482,7 +479,6 @@ export async function runEndpointsCommand(pi: ExtensionAPI, ctx: ExtensionComman
 
 	const endpoint = endpoints.find((saved) => saved.id === id);
 	const commands: Record<string, (endpoint: Endpoint) => Promise<void>> = {
-		use: (found) => useEndpoint(pi, ctx, found),
 		enable: (found) => setEnabled(pi, ctx, found, true),
 		disable: (found) => setEnabled(pi, ctx, found, false),
 		refresh: (found) => refreshEndpoint(pi, ctx, found),

@@ -75,9 +75,10 @@ function fakeAgent(answers: Answer[] = []) {
 	const keys = new Map<string, string>();
 	const notices: { message: string; type?: string }[] = [];
 	const prompts: string[] = [];
+	const offered = new Map<string, string[]>();
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
 	let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
-	let selectedModel: { provider: string; id: string } | undefined;
+	let editorText = "";
 
 	const next = (title: string) => {
 		prompts.push(title);
@@ -98,15 +99,9 @@ function fakeAgent(answers: Answer[] = []) {
 		registerCommand: (_name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
 			command = options.handler;
 		},
-		setModel: async (model: { provider: string; id: string }) => {
-			selectedModel = model;
-			return true;
-		},
 	} as unknown as ExtensionAPI;
 	const ctx = {
-		get model() {
-			return selectedModel;
-		},
+		model: undefined,
 		modelRegistry: {
 			getAll: () => models,
 			authStorage: {
@@ -118,12 +113,16 @@ function fakeAgent(answers: Answer[] = []) {
 		ui: {
 			input: async (title: string) => next(title),
 			select: async (title: string, options: string[]) => {
+				offered.set(title, options);
 				const answer = next(title) as string | undefined;
 				if (answer !== undefined) assert.ok(options.includes(answer), `"${answer}" is not among ${JSON.stringify(options)}`);
 				return answer;
 			},
 			confirm: async (title: string) => next(title),
 			notify: (message: string, type?: string) => notices.push({ message, type }),
+			setEditorText: (text: string) => {
+				editorText = text;
+			},
 		},
 	};
 	return {
@@ -135,13 +134,14 @@ function fakeAgent(answers: Answer[] = []) {
 		keys,
 		notices,
 		prompts,
+		offered,
 		handlers,
 		run: (args = "") => runEndpointsCommand(pi, ctx as never, args),
 		get command() {
 			return command;
 		},
-		get selectedModel() {
-			return selectedModel;
+		get editorText() {
+			return editorText;
 		},
 	};
 }
@@ -283,9 +283,9 @@ describe("loading", () => {
 });
 
 describe("/endpoints", () => {
-	test("adds an endpoint, saves its key and switches to one of its models", async () => {
+	test("adds an endpoint, saves its key and leaves the model picker ready for it", async () => {
 		const calls = stubFetch(() => json(vllmList("qwen", "llama")));
-		const agent = fakeAgent(["https://gpu.example.com/v1/", "sk-new", "My GPU", true, "llama"]);
+		const agent = fakeAgent(["https://gpu.example.com/v1/", "sk-new", "My GPU"]);
 		await agent.run("add");
 
 		assert.deepEqual(calls, [{ url: "https://gpu.example.com/v1/models", authorization: "Bearer sk-new" }]);
@@ -293,13 +293,13 @@ describe("/endpoints", () => {
 		assert.equal(agent.keys.get("my-gpu"), "sk-new");
 		assert.deepEqual(agent.models.filter((m) => m.provider === "my-gpu").map((m) => m.id), ["qwen", "llama"]);
 		assert.ok(existsSync(join(agentDir, "endpoints", "my-gpu.models.json")));
-		assert.deepEqual(agent.selectedModel, { provider: "my-gpu", id: "llama" });
-		assert.ok(agent.notices.some((notice) => notice.message === "Added My GPU with 2 models."));
+		assert.equal(agent.editorText, "/model my-gpu");
+		assert.deepEqual(agent.notices.at(-1), { message: "Added My GPU with 2 models. Press Enter to choose one.", type: "info" });
 	});
 
 	test("an endpoint without a key is added without saving one", async () => {
 		const calls = stubFetch(() => json(vllmList("m")));
-		const agent = fakeAgent(["http://127.0.0.1:11434/v1", "", "", false]);
+		const agent = fakeAgent(["http://127.0.0.1:11434/v1", "", ""]);
 		await agent.run("add");
 		assert.equal(calls[0].authorization, undefined);
 		assert.deepEqual(readEndpoints().map((saved) => [saved.id, saved.name]), [["127-0-0-1-11434", "127.0.0.1:11434"]]);
@@ -318,7 +318,7 @@ describe("/endpoints", () => {
 
 	test("refuses a name that is already a provider", async () => {
 		stubFetch(() => json(vllmList("m")));
-		const agent = fakeAgent(["https://api.example.com/v1", "sk", "OpenAI", "Example", false]);
+		const agent = fakeAgent(["https://api.example.com/v1", "sk", "OpenAI", "Example"]);
 		await agent.run("add");
 		assert.match(agent.notices[0].message, /"openai" is already a provider/);
 		assert.deepEqual(readEndpoints().map((saved) => saved.id), ["example"]);
@@ -339,23 +339,27 @@ describe("/endpoints", () => {
 
 		answers.push("Local [local] · 127.0.0.1:9 · disabled", "Enable");
 		await agent.run();
+		assert.ok(!agent.offered.get("Local [local] · 127.0.0.1:9 · disabled")?.includes("Choose one of its models"));
 		assert.equal(readEndpoints()[0].enabled, true);
 		assert.deepEqual(agent.models.filter((m) => m.provider === "local").map((m) => m.id), ["m1", "m2"]);
 		assert.ok(agent.notices.some((notice) => notice.message === "Local enabled with 2 models."));
 	});
 
-	test("switches models with the use shortcut and explains mistakes", async () => {
+	test("hands model choice to Prime Agent's picker and explains mistakes", async () => {
 		saveEndpoints([endpoint()]);
 		saveCache("local", Date.now(), [{ id: "m1" }, { id: "m2" }]);
-		const agent = fakeAgent(["m2"]);
+		const agent = fakeAgent(["Local [local] · 127.0.0.1:9 · 2 models", "Choose one of its models"]);
 		endpoints(agent.pi);
-		await agent.run("use local");
-		assert.deepEqual(agent.selectedModel, { provider: "local", id: "m2" });
+		await agent.run();
+		assert.equal(agent.editorText, "/model local");
+		assert.equal(agent.notices.at(-1)?.message, "Press Enter to choose one of Local's models.");
 
-		await agent.run("use nope");
+		await agent.run("enable nope");
 		assert.match(agent.notices.at(-1)?.message ?? "", /No endpoint "nope"\. Endpoints: local\./);
-		await agent.run("frobnicate local");
-		assert.match(agent.notices.at(-1)?.message ?? "", /^Usage: \/endpoints/);
+		for (const args of ["use local", "frobnicate local"]) {
+			await agent.run(args);
+			assert.match(agent.notices.at(-1)?.message ?? "", /^Usage: \/endpoints/);
+		}
 	});
 
 	test("changes the key, and deletes it when left empty", async () => {
