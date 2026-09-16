@@ -1,13 +1,15 @@
-# Prime Agent with Chutes
+# Prime Agent extensions
 
 ```sh
 curl -fsSL https://sirouk.github.io/prime-agent/install.sh | sh
 ```
 
-This installs [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) from its official release channel and adds the [Chutes](https://chutes.ai) extension. Run the same command again to update both.
+This installs [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) from its official release channel and adds the endpoints extension. Start `prime-agent` and run `/endpoints` to add any OpenAI-compatible endpoint with an API key, then choose its models in `/model`. Run the same command again to update.
 
-Then start `prime-agent`, run `/login` and choose **Chutes (Sign in with Chutes)**, or set `CHUTES_API_KEY`. Chutes models are listed under `/model`.
+For [Chutes](https://chutes.ai) with "Sign in with Chutes", add the Chutes extension:
 
-Also available: an extension for adding your own OpenAI-compatible endpoints with API keys and switching between them, described in the README linked below.
+```sh
+curl -fsSL https://sirouk.github.io/prime-agent/install.sh | PRIME_AGENT_WITH_CHUTES=1 sh
+```
 
-Source and details: [sirouk/prime-agent, `chutes-extension` branch](https://github.com/sirouk/prime-agent/tree/chutes-extension).
+Source and details: [sirouk/prime-agent, `extensions` branch](https://github.com/sirouk/prime-agent/tree/extensions).
