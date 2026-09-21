@@ -8,10 +8,13 @@ import endpoints, {
 	type CatalogEntry,
 	type Endpoint,
 	envVarFor,
+	mergeStatus,
 	parseCatalog,
 	readEndpoints,
 	runEndpointsCommand,
+	thinkingLevelMapFor,
 	toModel,
+	withThinkingGate,
 } from "../extensions/endpoints.ts";
 
 const chutes = JSON.parse(readFileSync(new URL("./fixtures/catalog.json", import.meta.url), "utf8")).data as CatalogEntry[];
@@ -255,7 +258,10 @@ describe("loading", () => {
 		agent.handlers.get("session_start")?.({}, agent.ctx);
 
 		for (let i = 0; i < 100 && agent.registrations.length < 3; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-		assert.deepEqual(calls, [{ url: "http://127.0.0.1:9/v1/models", authorization: "Bearer sk-saved" }]);
+		assert.deepEqual(calls, [
+			{ url: "http://127.0.0.1:9/v1/models", authorization: "Bearer sk-saved" },
+			{ url: "http://127.0.0.1:9/v1/status", authorization: "Bearer sk-saved" },
+		]);
 		assert.deepEqual(agent.models.filter((m) => m.provider === "local").map((m) => m.id), ["new-1", "new-2"]);
 		assert.deepEqual(
 			JSON.parse(readFileSync(join(agentDir, "endpoints", "local.models.json"), "utf8")).data.map((e: CatalogEntry) => e.id),
@@ -272,13 +278,15 @@ describe("loading", () => {
 		agent.handlers.get("session_start")?.({}, agent.ctx);
 		for (let i = 0; i < 100 && calls.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
 		assert.equal(calls[0]?.authorization, "Bearer sk-from-env");
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const before = calls.length;
 
 		process.env.PI_OFFLINE = "1";
 		const offline = fakeAgent();
 		endpoints(offline.pi);
 		offline.handlers.get("session_start")?.({}, offline.ctx);
 		await new Promise((resolve) => setTimeout(resolve, 20));
-		assert.equal(calls.length, 1);
+		assert.equal(calls.length, before);
 	});
 });
 
@@ -288,7 +296,10 @@ describe("/endpoints", () => {
 		const agent = fakeAgent(["https://gpu.example.com/v1/", "sk-new", "My GPU"]);
 		await agent.run("add");
 
-		assert.deepEqual(calls, [{ url: "https://gpu.example.com/v1/models", authorization: "Bearer sk-new" }]);
+		assert.deepEqual(calls, [
+			{ url: "https://gpu.example.com/v1/models", authorization: "Bearer sk-new" },
+			{ url: "https://gpu.example.com/v1/status", authorization: "Bearer sk-new" },
+		]);
 		assert.deepEqual(readEndpoints(), [{ id: "my-gpu", name: "My GPU", baseUrl: "https://gpu.example.com/v1", enabled: true }]);
 		assert.equal(agent.keys.get("my-gpu"), "sk-new");
 		assert.deepEqual(agent.models.filter((m) => m.provider === "my-gpu").map((m) => m.id), ["qwen", "llama"]);
@@ -398,5 +409,130 @@ describe("/endpoints", () => {
 		assert.equal(agent.keys.has("local"), false);
 		assert.deepEqual(agent.unregistered, ["local"]);
 		assert.equal(existsSync(join(agentDir, "endpoints", "local.models.json")), false);
+	});
+});
+
+describe("reasoning metadata", () => {
+	test("reads supports_reasoning, reasoning: true and reasoning.supported", () => {
+		for (const stated of [{ supports_reasoning: true }, { reasoning: true }, { reasoning: { supported: true } }]) {
+			assert.equal(toModel({ id: "m", ...stated }, endpoint())?.reasoning, true, JSON.stringify(stated));
+		}
+	});
+
+	test("an explicit false wins over listed capabilities", () => {
+		for (const stated of [{ supports_reasoning: false }, { reasoning: false }, { reasoning: { supported: false } }]) {
+			const model = toModel({ id: "m", supported_features: ["tools", "reasoning"], ...stated }, endpoint());
+			assert.equal(model?.reasoning, false, JSON.stringify(stated));
+		}
+	});
+
+	test("never infers reasoning from a model name", () => {
+		assert.equal(toModel({ id: "deepseek-r1-reasoning-thinking" }, endpoint())?.reasoning, false);
+	});
+});
+
+const loadedId = "orcarouter/Qwen3.8-27B-Uncensored-GGUF";
+const unslothStatus = {
+	supports_reasoning: true,
+	reasoning_style: "enable_thinking_effort",
+	reasoning_effort_levels: ["low", "medium", "xhigh"],
+	reasoning_always_on: false,
+	context_length: 188672,
+	loaded: [loadedId],
+};
+const unslothModels = { object: "list", data: [{ id: loadedId, object: "model" }, { id: "other/idle-model", object: "model" }] };
+
+describe("Unsloth /status", () => {
+	test("merges status metadata into loaded models only", () => {
+		const merged = mergeStatus(unslothModels.data, unslothStatus);
+		assert.equal(merged[0].reasoning_style, "enable_thinking_effort");
+		assert.equal(merged[0].context_length, 188672);
+		assert.deepEqual(merged[1], { id: "other/idle-model", object: "model" });
+		assert.deepEqual(mergeStatus(unslothModels.data, { ...unslothStatus, loaded: [] }), unslothModels.data);
+		assert.deepEqual(mergeStatus(unslothModels.data, undefined), unslothModels.data);
+	});
+
+	test("maps the reported effort levels exactly, in the default effort format", () => {
+		const [loaded] = mergeStatus(unslothModels.data, unslothStatus);
+		const model = toModel(loaded, endpoint());
+		assert.equal(model?.reasoning, true);
+		assert.equal(model?.contextWindow, 188672);
+		assert.deepEqual(model?.thinkingLevelMap, {
+			off: "none",
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: null,
+			xhigh: "xhigh",
+			max: null,
+		});
+		assert.deepEqual(model?.compat, {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			maxTokensField: "max_tokens",
+			supportsReasoningEffort: true,
+		});
+	});
+
+	test("keeps output limits separate from the context size", () => {
+		const [loaded] = mergeStatus(unslothModels.data, unslothStatus);
+		assert.equal(toModel(loaded, endpoint())?.maxTokens, 16384);
+		assert.equal(toModel(loaded, endpoint({ maxTokens: 8192 }))?.maxTokens, 8192);
+	});
+
+	test("a server that keeps reasoning on offers no off level", () => {
+		assert.equal(thinkingLevelMapFor(["low", "high"], true)?.off, null);
+		assert.equal(thinkingLevelMapFor(["low", "high"], false)?.off, "none");
+	});
+
+	test("without /status, discovery uses /models alone and guesses nothing", async () => {
+		stubFetch(({ url }) => (url.endsWith("/status") ? json({ error: "not found" }, 404) : json(unslothModels)));
+		const agent = fakeAgent(["http://127.0.0.1:8888/v1", "sk-local", "Unsloth"]);
+		await agent.run("add");
+		const model = agent.registrations.at(-1)?.config.models?.find((m) => m.id === loadedId);
+		assert.equal(model?.reasoning, false);
+		assert.equal(model?.thinkingLevelMap, undefined);
+		assert.equal(model?.contextWindow, 128000);
+	});
+});
+
+describe("Unsloth thinking gate", () => {
+	const efforts = new Set(["low", "medium", "xhigh"]);
+
+	test("turns thinking off for effort none and on for a listed effort, keeping reasoning_effort", () => {
+		assert.deepEqual(withThinkingGate({ model: "m", reasoning_effort: "none" }, "m", efforts), {
+			model: "m",
+			reasoning_effort: "none",
+			enable_thinking: false,
+		});
+		assert.deepEqual(withThinkingGate({ model: "m", reasoning_effort: "xhigh" }, "m", efforts), {
+			model: "m",
+			reasoning_effort: "xhigh",
+			enable_thinking: true,
+		});
+	});
+
+	test("leaves unlisted efforts, explicit enable_thinking and other models alone", () => {
+		assert.equal(withThinkingGate({ model: "m", reasoning_effort: "high" }, "m", efforts), undefined);
+		assert.equal(withThinkingGate({ model: "m", reasoning_effort: "low", enable_thinking: false }, "m", efforts), undefined);
+		assert.equal(withThinkingGate({ model: "other", reasoning_effort: "none" }, "m", efforts), undefined);
+		assert.equal(withThinkingGate({ model: "m" }, "m", efforts), undefined);
+		assert.equal(withThinkingGate(undefined, "m", efforts), undefined);
+	});
+
+	test("the registered hook applies to the session's gated model only", async () => {
+		stubFetch(({ url }) => json(url.endsWith("/status") ? unslothStatus : unslothModels));
+		const agent = fakeAgent(["http://127.0.0.1:8888/v1", "sk-local", "Unsloth"]);
+		endpoints(agent.pi);
+		await agent.run("add");
+		const hook = agent.handlers.get("before_provider_request") as unknown as (event: unknown, ctx: unknown) => unknown;
+		const request = (reasoning_effort: string, model = loadedId) => ({ type: "before_provider_request", payload: { model, reasoning_effort } });
+		const on = (provider: string, id: string) => ({ model: { provider, id } });
+
+		assert.deepEqual(hook(request("none"), on("unsloth", loadedId)), { model: loadedId, reasoning_effort: "none", enable_thinking: false });
+		assert.deepEqual(hook(request("low"), on("unsloth", loadedId)), { model: loadedId, reasoning_effort: "low", enable_thinking: true });
+		assert.equal(hook(request("none", "other/idle-model"), on("unsloth", "other/idle-model")), undefined);
+		assert.equal(hook(request("none"), on("another-endpoint", loadedId)), undefined);
+		assert.equal(hook(request("none"), { model: undefined }), undefined);
 	});
 });

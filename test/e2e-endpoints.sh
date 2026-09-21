@@ -85,3 +85,34 @@ isolated -- node "$root/test/e2e/endpoints-command.mjs" "$agent_bin" "$base_url"
 [ "$(request 'r.url === "/v1/models" && r.authorization === "Bearer sk-e2e"' 'true')" = "true" ] || fail "adding did not check the endpoint with its key"
 [ "$(request "$chat" 'r.body.model + " " + r.authorization')" = "m2 Bearer sk-e2e" ] || fail "the chat did not use the endpoint's model and key"
 stop_service
+
+# 5. An Unsloth-style server: /status marks the loaded model as needing enable_thinking
+#    next to reasoning_effort. The hook adds it; reasoning_effort goes out unchanged.
+status='{"supports_reasoning":true,"reasoning_style":"enable_thinking_effort","reasoning_effort_levels":["low","medium","xhigh"],"reasoning_always_on":false,"context_length":188672,"loaded":["zz-thinker"]}'
+start_mock --models zz-thinker --key sk-e2e --status "$status"
+new_home thinking
+cp "$extension" "$agent_dir/extensions/"
+printf '{ "endpoints": [{ "id": "unsloth", "name": "Unsloth", "baseUrl": "%s", "enabled": true }] }\n' "$base_url" >"$agent_dir/endpoints.json"
+printf '{"unsloth":{"type":"api_key","key":"sk-e2e"}}\n' >"$agent_dir/auth.json"
+chmod 600 "$agent_dir/auth.json"
+# A stale cache, so the session refreshes it from /models and /status in the background.
+save_endpoint_cache unsloth 1 zz-thinker
+for _ in $(seq 50); do
+	# The first run's refresh writes the merged catalog; later runs start from it.
+	agent -- -p "Reply with pong" --provider unsloth --model zz-thinker --thinking off >/dev/null || true
+	[ "$(json "$agent_dir/endpoints/unsloth.models.json" 'data.data[0].reasoning_style')" = "enable_thinking_effort" ] && break
+	sleep 0.2
+done
+[ "$(json "$agent_dir/endpoints/unsloth.models.json" 'data.data[0].context_length')" = "188672" ] || fail "/status was not merged into the loaded model"
+for level in off low xhigh; do
+	output=$(agent -- -p "Reply with pong" --provider unsloth --model zz-thinker --thinking "$level")
+	[[ "$output" == *"pong from mock"* ]] || fail "unexpected reply at thinking $level: $output"
+	sent=$(request "$chat" 'r.body.reasoning_effort + " " + r.body.enable_thinking')
+	case $level in
+		off) expected="none false" ;;
+		*) expected="$level true" ;;
+	esac
+	[ "$sent" = "$expected" ] || fail "thinking $level sent '$sent', expected '$expected'"
+done
+stop_service
+echo "ok   sends Unsloth's enable_thinking gate with reasoning_effort for off and listed levels"

@@ -1,16 +1,17 @@
 // OpenAI-compatible stand-in. GET /v1/models lists the --models ids; POST
-// /v1/chat/completions streams a fixed reply. Every request is logged as a JSON
-// line. With --key, both answer 401 unless "Authorization: Bearer <key>" is sent.
+// /v1/chat/completions streams a fixed reply; GET /v1/status returns --status
+// (JSON), like an Unsloth server, or 404 without it. Every request is logged as a
+// JSON line. With --key, all answer 401 unless "Authorization: Bearer <key>" is sent.
 // Prints the port it listens on.
 //
-// Usage: node mock-openai.mjs <log file> [--models a,b] [--key secret]
+// Usage: node mock-openai.mjs <log file> [--models a,b] [--key secret] [--status json]
 import { appendFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { parseArgs } from "node:util";
 
 const { positionals, values } = parseArgs({
 	allowPositionals: true,
-	options: { models: { type: "string", default: "" }, key: { type: "string" } },
+	options: { models: { type: "string", default: "" }, key: { type: "string" }, status: { type: "string" } },
 });
 const [logPath] = positionals;
 const models = values.models.split(",").filter(Boolean);
@@ -35,6 +36,8 @@ const server = createServer((request, response) => {
 		);
 		if (values.key && request.headers.authorization !== `Bearer ${values.key}`) {
 			response.writeHead(401, { "Content-Type": "application/json" }).end('{"error":"invalid api key"}');
+		} else if (request.method === "GET" && request.url === "/v1/status" && values.status) {
+			response.writeHead(200, { "Content-Type": "application/json" }).end(values.status);
 		} else if (request.method === "GET" && request.url === "/v1/models") {
 			response.writeHead(200, { "Content-Type": "application/json" });
 			response.end(JSON.stringify({ object: "list", data: models.map((id) => ({ id, object: "model", max_model_len: 32768 })) }));
