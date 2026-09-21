@@ -16,6 +16,8 @@
  *   reasoning and tool support are read where the endpoint reports them (the
  *   Chutes, OpenRouter and vLLM formats); otherwise Prime Agent's defaults for
  *   custom models apply.
+ * - Servers that describe their loaded model in `GET /status` (Unsloth) add its
+ *   reasoning controls and context size there; see mergeStatus.
  */
 
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -155,6 +157,33 @@ function field(entry: CatalogEntry, parent: string, key: string): unknown {
 	return object && typeof object === "object" ? (object as Record<string, unknown>)[key] : undefined;
 }
 
+/**
+ * Reasoning support stated by the entry: `supports_reasoning`, `reasoning: true` or
+ * `reasoning: { supported: true }`. An explicit false wins; undefined when silent.
+ */
+function statedReasoning(entry: CatalogEntry): boolean | undefined {
+	const stated = [entry.supports_reasoning, entry.reasoning, field(entry, "reasoning", "supported")].filter(
+		(value): value is boolean => typeof value === "boolean",
+	);
+	if (stated.includes(false)) return false;
+	return stated.includes(true) ? true : undefined;
+}
+
+/** Prime Agent's thinking levels above "off". */
+const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * Maps Prime Agent's thinking levels onto the effort values a server lists, sent as
+ * reasoning_effort. Levels it does not list are hidden (null); "off" sends "none"
+ * unless the server keeps reasoning always on.
+ */
+export function thinkingLevelMapFor(effortLevels: string[], alwaysOn: boolean): ProviderModelConfig["thinkingLevelMap"] {
+	return {
+		off: alwaysOn ? null : "none",
+		...Object.fromEntries(THINKING_LEVELS.map((level) => [level, effortLevels.includes(level) ? level : null])),
+	};
+}
+
 /** Maps a model list entry, or returns undefined for a model the endpoint says cannot call tools. */
 export function toModel(entry: CatalogEntry, endpoint: Endpoint): ProviderModelConfig | undefined {
 	// Chutes lists capabilities in supported_features, OpenRouter in supported_parameters.
@@ -171,17 +200,29 @@ export function toModel(entry: CatalogEntry, endpoint: Endpoint): ProviderModelC
 		endpoint.maxTokens ??
 		DEFAULT_MAX_TOKENS;
 	const inputs = [...strings(entry.input_modalities), ...strings(field(entry, "architecture", "input_modalities"))];
+	const reasoning = statedReasoning(entry) ?? capabilities.includes("reasoning");
+	const effortLevels = strings(entry.reasoning_effort_levels);
+	const effortControl = reasoning && effortLevels.length > 0;
 	return {
 		id: entry.id,
 		name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : entry.id,
-		reasoning: capabilities.includes("reasoning"),
+		reasoning,
 		input: inputs.includes("image") ? ["text", "image"] : ["text"],
 		// Endpoints report prices in different units, so usage is not priced.
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow,
 		maxTokens: Math.min(outputLimit, contextWindow),
-		// The broadly supported request shape: a system message, max_tokens, no store.
-		compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens" },
+		// The broadly supported request shape: a system message, max_tokens, no store. With
+		// listed effort levels, thinking goes out as reasoning_effort (the default format).
+		compat: {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			maxTokensField: "max_tokens",
+			...(effortControl ? { supportsReasoningEffort: true } : {}),
+		},
+		...(effortControl
+			? { thinkingLevelMap: thinkingLevelMapFor(effortLevels, entry.reasoning_always_on === true) }
+			: {}),
 	};
 }
 
@@ -194,7 +235,46 @@ export function parseCatalog(payload: unknown): CatalogEntry[] {
 	return data.filter((entry): entry is CatalogEntry => typeof entry?.id === "string");
 }
 
+/** Fields of an Unsloth `GET /status` that describe the loaded model(s). */
+const STATUS_FIELDS = [
+	"supports_reasoning",
+	"reasoning_style",
+	"reasoning_effort_levels",
+	"reasoning_always_on",
+	"context_length",
+] as const;
+
+/**
+ * Copies a server status's model metadata onto the entries it lists as loaded.
+ * Unsloth's /models omits reasoning and context details that /status reports.
+ */
+export function mergeStatus(entries: CatalogEntry[], status: unknown): CatalogEntry[] {
+	const report = (status && typeof status === "object" ? status : {}) as Record<string, unknown>;
+	const loaded = new Set(strings(report.loaded));
+	const metadata = Object.fromEntries(STATUS_FIELDS.filter((key) => report[key] !== undefined).map((key) => [key, report[key]]));
+	if (loaded.size === 0 || Object.keys(metadata).length === 0) return entries;
+	return entries.map((entry) => (loaded.has(entry.id) ? { ...entry, ...metadata } : entry));
+}
+
+/** The server's /status, when it has one; undefined otherwise, so discovery falls back to /models alone. */
+async function fetchStatus(baseUrl: string, apiKey: string | undefined): Promise<unknown> {
+	try {
+		const response = await fetch(`${baseUrl}/status`, {
+			headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+			signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
+		});
+		return response.ok ? await response.json() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function fetchCatalog(baseUrl: string, apiKey: string | undefined): Promise<CatalogEntry[]> {
+	const [entries, status] = await Promise.all([fetchModelList(baseUrl, apiKey), fetchStatus(baseUrl, apiKey)]);
+	return mergeStatus(entries, status);
+}
+
+async function fetchModelList(baseUrl: string, apiKey: string | undefined): Promise<CatalogEntry[]> {
 	let response: Response;
 	try {
 		response = await fetch(`${baseUrl}/models`, {
@@ -266,7 +346,39 @@ async function keyFor(ctx: ExtensionContext, id: string): Promise<string | undef
 	return saved || process.env[envVarFor(id)] || undefined;
 }
 
+/**
+ * Models whose server gates thinking with a boolean enable_thinking next to
+ * reasoning_effort ("enable_thinking_effort"), keyed "provider/id", with the effort
+ * values that turn thinking on. reasoning_effort "none" alone does not turn it off.
+ */
+const thinkingGates = new Map<string, Set<string>>();
+
+/**
+ * Adds enable_thinking to a request for a gated model: false for effort "none", true
+ * for an effort the server lists. Returns undefined to leave the payload unchanged,
+ * including when enable_thinking is already set or the request is for another model.
+ */
+export function withThinkingGate(payload: unknown, modelId: string, enabledEfforts: ReadonlySet<string>): unknown {
+	if (!payload || typeof payload !== "object") return undefined;
+	const body = payload as Record<string, unknown>;
+	if (body.model !== modelId || "enable_thinking" in body) return undefined;
+	if (body.reasoning_effort === "none") return { ...body, enable_thinking: false };
+	if (typeof body.reasoning_effort === "string" && enabledEfforts.has(body.reasoning_effort)) {
+		return { ...body, enable_thinking: true };
+	}
+	return undefined;
+}
+
 function register(pi: ExtensionAPI, endpoint: Endpoint, entries: CatalogEntry[]): void {
+	for (const key of thinkingGates.keys()) {
+		if (key.startsWith(`${endpoint.id}/`)) thinkingGates.delete(key);
+	}
+	for (const entry of entries) {
+		const model = toModel(entry, endpoint);
+		if (model?.reasoning && entry.reasoning_style === "enable_thinking_effort") {
+			thinkingGates.set(`${endpoint.id}/${entry.id}`, new Set(strings(entry.reasoning_effort_levels)));
+		}
+	}
 	pi.registerProvider(endpoint.id, {
 		name: endpoint.name,
 		baseUrl: endpoint.baseUrl,
@@ -502,6 +614,13 @@ export default function endpoints(pi: ExtensionAPI): void {
 	for (const endpoint of readEndpoints()) {
 		if (endpoint.enabled) register(pi, endpoint, readCachedCatalog(endpoint.id)?.entries ?? []);
 	}
+
+	// The event carries only the payload; ctx.model says which model the session is on.
+	pi.on("before_provider_request", (event, ctx) => {
+		const model = ctx.model;
+		const efforts = model && thinkingGates.get(`${model.provider}/${model.id}`);
+		return efforts ? withThinkingGate(event.payload, model.id, efforts) : undefined;
+	});
 
 	pi.on("session_start", (_event, ctx) => {
 		if (isOffline()) return;
