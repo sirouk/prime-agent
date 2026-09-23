@@ -201,7 +201,8 @@ export function toModel(entry: CatalogEntry, endpoint: Endpoint): ProviderModelC
 		DEFAULT_MAX_TOKENS;
 	const inputs = [...strings(entry.input_modalities), ...strings(field(entry, "architecture", "input_modalities"))];
 	const reasoning = statedReasoning(entry) ?? capabilities.includes("reasoning");
-	const effortLevels = strings(entry.reasoning_effort_levels);
+	// Effort levels are stated flat (Unsloth: reasoning_effort_levels) or nested (reasoning.levels).
+	const effortLevels = [...strings(entry.reasoning_effort_levels), ...strings(field(entry, "reasoning", "levels"))];
 	const effortControl = reasoning && effortLevels.length > 0;
 	return {
 		id: entry.id,

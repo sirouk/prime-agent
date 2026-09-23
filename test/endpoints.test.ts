@@ -429,6 +429,28 @@ describe("reasoning metadata", () => {
 	test("never infers reasoning from a model name", () => {
 		assert.equal(toModel({ id: "deepseek-r1-reasoning-thinking" }, endpoint())?.reasoning, false);
 	});
+
+	test("reads effort levels nested under reasoning.levels, keeping xhigh and max", () => {
+		const model = toModel(
+			{ id: "m", reasoning: { supported: true, effort_control: true, levels: ["low", "medium", "high", "xhigh", "max"] } },
+			endpoint(),
+		);
+		assert.deepEqual(model?.thinkingLevelMap, {
+			off: "none",
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: "max",
+		});
+		assert.deepEqual(model?.compat, {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			maxTokensField: "max_tokens",
+			supportsReasoningEffort: true,
+		});
+	});
 });
 
 const loadedId = "orcarouter/Qwen3.8-27B-Uncensored-GGUF";
