@@ -189,6 +189,25 @@ describe("models from an endpoint's list", () => {
 		);
 	});
 
+	test("reads a gateway's display_name, max_output_tokens and input_modalities", () => {
+		const entry: CatalogEntry = {
+			id: "claude-sonnet-5",
+			object: "model",
+			owned_by: "anthropic",
+			display_name: "Claude Sonnet 5",
+			context_length: 1000000,
+			max_output_tokens: 128000,
+			input_modalities: ["text", "image"],
+			reasoning: { supported: true, effort_control: true, levels: ["low", "medium", "high"] },
+		};
+		const model = toModel(entry, endpoint());
+		assert.deepEqual(
+			[model?.name, model?.contextWindow, model?.maxTokens, model?.input, model?.reasoning],
+			["Claude Sonnet 5", 1000000, 128000, ["text", "image"], true],
+		);
+		assert.equal(toModel({ ...entry, name: "Given Name" }, endpoint())?.name, "Given Name", "name wins over display_name");
+	});
+
 	test("falls back to the endpoint's limits, then Prime Agent's defaults", () => {
 		const plain: CatalogEntry = { id: "llama3.1:8b", object: "model", owned_by: "library" };
 		const defaults = toModel(plain, endpoint());
