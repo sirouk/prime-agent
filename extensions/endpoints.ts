@@ -12,10 +12,10 @@
  *   `/logout` work on them too.
  * - Models come from each endpoint's `GET /models`. The list is cached per
  *   endpoint, so startup never waits on the network, and refreshed in the
- *   background when a session starts. Context size, output limit, image input,
- *   reasoning and tool support are read where the endpoint reports them (the
- *   Chutes, OpenRouter and vLLM formats); otherwise Prime Agent's defaults for
- *   custom models apply.
+ *   background when a session starts. Name, context size, output limit, image
+ *   input, reasoning and tool support are read where the endpoint reports them
+ *   (the Chutes, OpenRouter and vLLM formats, or display_name, max_output_tokens
+ *   and input_modalities); otherwise Prime Agent's defaults for custom models apply.
  * - Servers that describe their loaded model in `GET /status` (Unsloth) add its
  *   reasoning controls and context size there; see mergeStatus.
  */
@@ -196,6 +196,7 @@ export function toModel(entry: CatalogEntry, endpoint: Endpoint): ProviderModelC
 		positive(entry.context_length) ?? positive(entry.max_model_len) ?? endpoint.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
 	const outputLimit =
 		positive(entry.max_output_length) ??
+		positive(entry.max_output_tokens) ??
 		positive(field(entry, "top_provider", "max_completion_tokens")) ??
 		endpoint.maxTokens ??
 		DEFAULT_MAX_TOKENS;
@@ -204,9 +205,10 @@ export function toModel(entry: CatalogEntry, endpoint: Endpoint): ProviderModelC
 	// Effort levels are stated flat (Unsloth: reasoning_effort_levels) or nested (reasoning.levels).
 	const effortLevels = [...strings(entry.reasoning_effort_levels), ...strings(field(entry, "reasoning", "levels"))];
 	const effortControl = reasoning && effortLevels.length > 0;
+	const name = [entry.name, entry.display_name].find((value) => typeof value === "string" && value.trim());
 	return {
 		id: entry.id,
-		name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : entry.id,
+		name: typeof name === "string" ? name.trim() : entry.id,
 		reasoning,
 		input: inputs.includes("image") ? ["text", "image"] : ["text"],
 		// Endpoints report prices in different units, so usage is not priced.
