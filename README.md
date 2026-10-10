@@ -18,7 +18,7 @@ The installer:
 4. installs `prime-agent-endpoints` next to `prime-agent` (`~/.local/bin`);
 5. removes the endpoints and Chutes extensions an earlier version of this installer saved in `~/.prime/agent/extensions/`, which Prime Agent v0.10.0 no longer loads (a file you wrote yourself is left alone), and carries your saved endpoints over to `models.json`.
 
-Run it again at any time to update. The helper needs Python 3.9 or newer, or uv, which Prime Agent's installer provides.
+Run it again at any time to update both, or run `prime-agent-endpoints update` to update just the helper (it checks the download against its published SHA-256 first; `--check` only reports). The helper needs Python 3.9 or newer, or uv, which Prime Agent's installer provides.
 
 ## Use
 
@@ -31,6 +31,7 @@ prime-agent-endpoints enable <id>
 prime-agent-endpoints key <id>          # save a new key; --remove deletes it
 prime-agent-endpoints url <id> <url>
 prime-agent-endpoints remove <id>
+prime-agent-endpoints update            # the helper itself
 prime-agent-endpoints                   # a menu, in a terminal
 ```
 
