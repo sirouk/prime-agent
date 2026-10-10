@@ -3,6 +3,7 @@
 import contextlib
 import importlib.machinery
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -477,6 +478,64 @@ class Commands(HelperTestCase):
         code, out, _ = self.run_cli("sync")
         self.assertEqual((code, out), (0, "local: 1 models.\n"))
         self.assertEqual(self.providers()["local"]["models"][0]["contextWindow"], 32000)
+
+
+class Update(HelperTestCase):
+    def publish(self, script: bytes, checksum: Optional[str] = None) -> str:
+        digest = checksum or hashlib.sha256(script).hexdigest()
+        server = self.mock(
+            files={
+                "/helper/prime-agent-endpoints": script,
+                "/helper/SHA256SUMS": f"{digest}  prime-agent-endpoints\n".encode(),
+            }
+        )
+        os.environ["PRIME_AGENT_ENDPOINTS_BASE_URL"] = f"http://127.0.0.1:{server.port}"
+        self.addCleanup(os.environ.pop, "PRIME_AGENT_ENDPOINTS_BASE_URL", None)
+        return self.installed("old version\n")
+
+    def installed(self, content: str) -> str:
+        path = os.path.join(self.directory.name, "prime-agent-endpoints")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(path, 0o755)
+        patch = unittest.mock.patch.object(helper, "__file__", path)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return path
+
+    def test_replaces_the_helper_with_the_published_one_and_keeps_it_executable(self) -> None:
+        path = self.publish(b"new version\n")
+        code, out, err = self.run_cli("update")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Updated", out)
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "new version\n")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o755)
+        self.assertEqual(self.run_cli("update")[1], "Already up to date.\n")
+
+    def test_check_reports_without_changing_anything(self) -> None:
+        path = self.publish(b"new version\n")
+        code, out, _ = self.run_cli("update", "--check")
+        self.assertEqual(code, 0)
+        self.assertIn("update is available", out)
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "old version\n")
+
+    def test_refuses_a_download_that_does_not_match_its_checksum(self) -> None:
+        path = self.publish(b"tampered\n", checksum="0" * 64)
+        code, _, err = self.run_cli("update")
+        self.assertEqual(code, 1)
+        self.assertIn("does not match its published checksum", err)
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "old version\n")
+
+    def test_names_the_site_when_it_cannot_be_reached(self) -> None:
+        self.installed("old version\n")
+        os.environ["PRIME_AGENT_ENDPOINTS_BASE_URL"] = "http://127.0.0.1:9"
+        self.addCleanup(os.environ.pop, "PRIME_AGENT_ENDPOINTS_BASE_URL", None)
+        code, _, err = self.run_cli("update")
+        self.assertEqual(code, 1)
+        self.assertIn("could not download the helper from http://127.0.0.1:9", err)
 
 
 if __name__ == "__main__":

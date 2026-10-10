@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -38,6 +39,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 DEFAULT_CONTEXT_WINDOW = 128_000
 DEFAULT_MAX_TOKENS = 16_384
 CATALOG_TIMEOUT_S = 10
+HELPER_NAME = "prime-agent-endpoints"
+DEFAULT_BASE_URL = "https://sirouk.github.io/prime-agent"
 ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 THINKING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -341,13 +344,17 @@ def describe(error: BaseException) -> str:
     return str(error) or error.__class__.__name__
 
 
-def http_get_json(url: str, api_key: Optional[str]) -> Any:
-    headers = {"Accept": "application/json", "User-Agent": "prime-agent-endpoints"}
+def http_get(url: str, api_key: Optional[str] = None) -> bytes:
+    headers = {"User-Agent": "prime-agent-endpoints"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(url, headers=headers)
     with _opener.open(request, timeout=CATALOG_TIMEOUT_S) as response:
-        return json.loads(response.read().decode("utf-8"))
+        return response.read()
+
+
+def http_get_json(url: str, api_key: Optional[str]) -> Any:
+    return json.loads(http_get(url, api_key).decode("utf-8"))
 
 
 def parse_catalog(payload: Any) -> List[CatalogEntry]:
@@ -843,6 +850,29 @@ def cmd_remove(args: argparse.Namespace) -> None:
     print(f'{endpoint["name"]} removed.')
 
 
+def cmd_update(args: argparse.Namespace) -> None:
+    """Replaces this script with the one published beside the installer, after checking its SHA-256."""
+    base = os.environ.get("PRIME_AGENT_ENDPOINTS_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    try:
+        sums = http_get(f"{base}/helper/SHA256SUMS").decode("utf-8")
+        latest = http_get(f"{base}/helper/{HELPER_NAME}")
+    except (urllib.error.URLError, OSError, UnicodeDecodeError) as error:
+        raise Fail(f"could not download the helper from {base}: {describe(error)}") from error
+    published = {parts[1]: parts[0] for parts in (line.split() for line in sums.splitlines()) if len(parts) == 2}
+    if hashlib.sha256(latest).hexdigest() != published.get(HELPER_NAME):
+        raise Fail(f"{HELPER_NAME} from {base} does not match its published checksum; nothing was changed.")
+    path = os.path.realpath(__file__)
+    with open(path, "rb") as handle:
+        current = handle.read()
+    if current == latest:
+        print("Already up to date.")
+    elif args.check:
+        print("An update is available. Run: prime-agent-endpoints update")
+    else:
+        write_text_atomically(path, latest.decode("utf-8"))
+        print(f"Updated {path}.")
+
+
 def cmd_sync(_args: argparse.Namespace) -> None:
     counts = sync_models()
     for endpoint_id, count in counts.items():
@@ -944,6 +974,9 @@ def build_parser() -> argparse.ArgumentParser:
     remove.add_argument("--yes", action="store_true", help="do not ask for confirmation")
 
     command("sync", cmd_sync, "rebuild models.json from endpoints.json and the cached model lists, without network")
+
+    update = command("update", cmd_update, "replace this helper with the latest published version, after checking its checksum")
+    update.add_argument("--check", action="store_true", help="only report whether an update is available")
     return parser
 
 

@@ -42,6 +42,7 @@ class MockServer:
         status: Optional[Dict[str, Any]] = None,
         catalog: Optional[List[Dict[str, Any]]] = None,
         redirect_to: Optional[str] = None,
+        files: Optional[Dict[str, bytes]] = None,
         on_request: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.requests: List[Dict[str, Any]] = []
@@ -70,6 +71,11 @@ class MockServer:
                     self.end_headers()
                 elif key and self.headers.get("Authorization") != f"Bearer {key}":
                     self.send_json(401, {"error": "invalid api key"})
+                elif self.command == "GET" and files and self.path in files:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(files[self.path])))
+                    self.end_headers()
+                    self.wfile.write(files[self.path])
                 elif self.command == "GET" and self.path.endswith("/v1/status") and status is not None:
                     self.send_json(200, status)
                 elif self.command == "GET" and self.path.endswith("/v1/models"):
