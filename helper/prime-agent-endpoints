@@ -1,0 +1,971 @@
+#!/usr/bin/env python3
+"""Manage OpenAI-compatible endpoints for Prime Agent.
+
+Prime Agent has no extension API from v0.10.0 on, so this helper does what the
+/endpoints extension did through the one extension point that remains:
+~/.prime/agent/models.json.
+
+  endpoints.json       the endpoints you manage (id, name, URL, enabled); edit by hand if you like
+  endpoints/<id>.models.json
+                       each endpoint's model list as the server last reported it
+  models.json          a provider block per enabled endpoint, generated from the two above;
+                       other providers in the file are left alone
+  auth.json            API keys, in Prime Agent's credential store, so /login and /logout work
+
+Run it with no arguments for a menu, or see `prime-agent-endpoints --help`.
+A running Prime Agent reads models.json when it refreshes its model list: restart it, or run
+/reload, if a change is not in /model yet.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import getpass
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+# What Prime Agent uses for custom models that leave these out.
+DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_MAX_TOKENS = 16_384
+CATALOG_TIMEOUT_S = 10
+ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+THINKING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+# Provider ids Prime Agent ships models for. An endpoint with one of these ids would
+# override the built-in provider instead of adding a new one.
+BUILT_IN_PROVIDERS = frozenset(
+    """amazon-bedrock anthropic azure-openai-responses cerebras cloudflare-ai-gateway
+    cloudflare-workers-ai deepseek fireworks github-copilot google google-vertex groq
+    huggingface kimi-coding minimax minimax-cn mistral moonshotai moonshotai-cn openai
+    openai-codex opencode opencode-go openrouter prime-inference vercel-ai-gateway xai
+    xiaomi xiaomi-token-plan-ams xiaomi-token-plan-cn xiaomi-token-plan-sgp zai""".split()
+)
+
+
+class Fail(Exception):
+    """A problem to report to the user, without a traceback."""
+
+
+# ---------------------------------------------------------------------------
+# Files
+# ---------------------------------------------------------------------------
+
+
+def agent_dir() -> str:
+    path = os.environ.get("PRIME_AGENT_CODING_AGENT_DIR") or os.path.join("~", ".prime", "agent")
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def endpoints_path() -> str:
+    return os.path.join(agent_dir(), "endpoints.json")
+
+
+def models_path() -> str:
+    return os.path.join(agent_dir(), "models.json")
+
+
+def auth_path() -> str:
+    return os.path.join(agent_dir(), "auth.json")
+
+
+def cache_path(endpoint_id: str) -> str:
+    return os.path.join(agent_dir(), "endpoints", f"{endpoint_id}.models.json")
+
+
+def strip_json_comments(text: str) -> str:
+    """Prime Agent reads models.json with // comments and trailing commas allowed."""
+    without_comments: List[str] = []
+    in_string = escaped = False
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if in_string:
+            without_comments.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            without_comments.append(char)
+        elif char == "/" and text[i + 1 : i + 2] == "/":
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            without_comments.append(char)
+        i += 1
+
+    cleaned: List[str] = []
+    in_string = escaped = False
+    chars = "".join(without_comments)
+    i = 0
+    while i < len(chars):
+        char = chars[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == ",":
+            j = i + 1
+            while j < len(chars) and chars[j].isspace():
+                j += 1
+            if j < len(chars) and chars[j] in "}]":
+                i += 1
+                continue
+        cleaned.append(char)
+        i += 1
+    return "".join(cleaned)
+
+
+def read_json(path: str, lenient: bool = False) -> Optional[Any]:
+    """The parsed file, or None when it does not exist. A malformed file fails with its path."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return None
+    try:
+        return json.loads(strip_json_comments(text) if lenient else text)
+    except json.JSONDecodeError as error:
+        raise Fail(f"{path}: {error}") from error
+
+
+def write_text_atomically(path: str, text: str, mode: Optional[int] = None) -> None:
+    """Writes beside the target and renames, so a reader never sees half a file."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    if mode is None:
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o644
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+        raise
+
+
+def write_json_atomically(path: str, value: Any, mode: Optional[int] = None) -> None:
+    write_text_atomically(path, json.dumps(value, indent=2, ensure_ascii=False) + "\n", mode)
+
+
+# ---------------------------------------------------------------------------
+# Saved endpoints
+# ---------------------------------------------------------------------------
+
+Endpoint = Dict[str, Any]
+
+
+def is_http_url(value: str) -> bool:
+    parsed = urllib.parse.urlsplit(value)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def parse_endpoint(value: Any, where: str) -> Endpoint:
+    entry = value if isinstance(value, dict) else {}
+    endpoint_id = entry.get("id")
+    if not isinstance(endpoint_id, str) or not ID_PATTERN.match(endpoint_id):
+        raise Fail(f'{where}: "id" must be lowercase letters, digits and single dashes')
+    name = entry.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise Fail(f'{where}: "name" is required')
+    base_url = entry.get("baseUrl")
+    if not isinstance(base_url, str) or not is_http_url(base_url):
+        raise Fail(f'{where}: "baseUrl" must be an http or https URL')
+    enabled = entry.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise Fail(f'{where}: "enabled" must be true or false')
+    endpoint: Endpoint = {
+        "id": endpoint_id,
+        "name": name.strip(),
+        "baseUrl": base_url.rstrip("/"),
+        "enabled": enabled,
+    }
+    for limit_name in ("contextWindow", "maxTokens"):
+        if limit_name not in entry:
+            continue
+        limit = entry[limit_name]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise Fail(f'{where}: "{limit_name}" must be a positive whole number')
+        endpoint[limit_name] = limit
+    return endpoint
+
+
+def read_endpoints() -> List[Endpoint]:
+    path = endpoints_path()
+    document = read_json(path)
+    if document is None:
+        return []
+    if not isinstance(document, dict) or not isinstance(document.get("endpoints"), list):
+        raise Fail(f'{path}: "endpoints" must be a list')
+    endpoints = [parse_endpoint(value, f"{path}: endpoints[{index}]") for index, value in enumerate(document["endpoints"])]
+    seen = set()
+    for endpoint in endpoints:
+        if endpoint["id"] in seen:
+            raise Fail(f'{path}: the id "{endpoint["id"]}" is used twice')
+        seen.add(endpoint["id"])
+    return endpoints
+
+
+def write_endpoints(endpoints: List[Endpoint]) -> None:
+    write_json_atomically(endpoints_path(), {"endpoints": endpoints})
+
+
+def find_endpoint(endpoints: List[Endpoint], endpoint_id: str) -> Endpoint:
+    for endpoint in endpoints:
+        if endpoint["id"] == endpoint_id:
+            return endpoint
+    known = ", ".join(endpoint["id"] for endpoint in endpoints) or "none yet"
+    raise Fail(f'No endpoint "{endpoint_id}". Endpoints: {known}.')
+
+
+# ---------------------------------------------------------------------------
+# Keys: Prime Agent's auth.json, under the lock Prime Agent itself takes
+# ---------------------------------------------------------------------------
+
+LOCK_STALE_S = 10
+LOCK_ATTEMPTS = 100
+LOCK_RETRY_S = 0.02
+
+
+@contextlib.contextmanager
+def auth_lock() -> Iterator[None]:
+    """The `auth.json.lock` directory, the convention Prime Agent's credential store uses."""
+    os.makedirs(agent_dir(), exist_ok=True)
+    lock = auth_path() + ".lock"
+    for _ in range(LOCK_ATTEMPTS):
+        try:
+            os.mkdir(lock)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > LOCK_STALE_S:
+                    with contextlib.suppress(OSError):
+                        os.rmdir(lock)
+                    continue
+            except FileNotFoundError:
+                continue
+            time.sleep(LOCK_RETRY_S)
+    else:
+        raise Fail(f"Could not lock {auth_path()}; is another Prime Agent writing it?")
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.rmdir(lock)
+
+
+def read_auth() -> Dict[str, Any]:
+    document = read_json(auth_path())
+    if document is None:
+        return {}
+    if not isinstance(document, dict):
+        raise Fail(f"{auth_path()}: expected a JSON object")
+    return document
+
+
+def stored_key(endpoint_id: str) -> Optional[str]:
+    credential = read_auth().get(endpoint_id)
+    if isinstance(credential, dict) and credential.get("type") == "api_key":
+        key = credential.get("key")
+        return key if isinstance(key, str) and key else None
+    return None
+
+
+def save_key(endpoint_id: str, key: Optional[str]) -> None:
+    """Stores the key, or deletes the saved key when `key` is None."""
+    with auth_lock():
+        document = read_auth()
+        if key is None:
+            document.pop(endpoint_id, None)
+        else:
+            document[endpoint_id] = {"type": "api_key", "key": key}
+        write_json_atomically(auth_path(), document, mode=0o600)
+
+
+def env_var_for(endpoint_id: str) -> str:
+    """The environment variable that can also hold a key: TOGETHER_API_KEY for "together"."""
+    return endpoint_id.upper().replace("-", "_") + "_API_KEY"
+
+
+def key_for(endpoint_id: str) -> Optional[str]:
+    return stored_key(endpoint_id) or os.environ.get(env_var_for(endpoint_id)) or None
+
+
+# ---------------------------------------------------------------------------
+# Fetching models
+# ---------------------------------------------------------------------------
+
+CatalogEntry = Dict[str, Any]
+
+
+class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
+    """Never forwards the API key to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        if urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            raise urllib.error.HTTPError(req.full_url, code, f"redirected to another host ({newurl})", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_SameHostRedirects)
+
+
+def describe(error: BaseException) -> str:
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
+        return str(error.reason)
+    return str(error) or error.__class__.__name__
+
+
+def http_get_json(url: str, api_key: Optional[str]) -> Any:
+    headers = {"Accept": "application/json", "User-Agent": "prime-agent-endpoints"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(url, headers=headers)
+    with _opener.open(request, timeout=CATALOG_TIMEOUT_S) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def parse_catalog(payload: Any) -> List[CatalogEntry]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise Fail("the response is not an OpenAI-compatible model list")
+    return [entry for entry in data if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
+
+
+def fetch_model_list(base_url: str, api_key: Optional[str]) -> List[CatalogEntry]:
+    url = f"{base_url}/models"
+    try:
+        return parse_catalog(http_get_json(url, api_key))
+    except urllib.error.HTTPError as error:
+        error.close()
+        if error.code in (401, 403):
+            raise Fail(f"{url} refused the API key (HTTP {error.code})") from error
+        if 300 <= error.code < 400:
+            raise Fail(f"{url} {error.msg}") from error
+        raise Fail(f"{url} answered HTTP {error.code}") from error
+    except (urllib.error.URLError, OSError) as error:
+        raise Fail(f"could not reach {url}: {describe(error)}") from error
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise Fail(f"{url}: not JSON ({error})") from error
+    except Fail as error:
+        raise Fail(f"{url}: {error}") from error
+
+
+# Fields of an Unsloth `GET /status` that describe the loaded model(s).
+STATUS_FIELDS = (
+    "supports_reasoning",
+    "reasoning_style",
+    "reasoning_effort_levels",
+    "reasoning_always_on",
+    "context_length",
+)
+
+
+def merge_status(entries: List[CatalogEntry], status: Any) -> List[CatalogEntry]:
+    """Unsloth's /models omits reasoning and context details that /status reports for the loaded model."""
+    report = status if isinstance(status, dict) else {}
+    loaded = set(strings(report.get("loaded")))
+    metadata = {key: report[key] for key in STATUS_FIELDS if key in report}
+    if not loaded or not metadata:
+        return entries
+    return [{**entry, **metadata} if entry["id"] in loaded else entry for entry in entries]
+
+
+def fetch_status(base_url: str, api_key: Optional[str]) -> Any:
+    """The server's /status when it has one, else None so discovery uses /models alone."""
+    try:
+        return http_get_json(f"{base_url}/status", api_key)
+    except urllib.error.HTTPError as error:
+        error.close()
+        return None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def fetch_catalog(base_url: str, api_key: Optional[str]) -> List[CatalogEntry]:
+    entries = fetch_model_list(base_url, api_key)
+    return merge_status(entries, fetch_status(base_url, api_key))
+
+
+def read_cached_catalog(endpoint_id: str) -> Optional[List[CatalogEntry]]:
+    try:
+        document = read_json(cache_path(endpoint_id))
+        return parse_catalog(document) if document is not None else None
+    except Fail:
+        # An unreadable cache is the same as none; refresh rewrites it.
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Catalog entry -> models.json model
+# ---------------------------------------------------------------------------
+
+
+def positive(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if value > 0 and value == value and value != float("inf") else None
+
+
+def strings(value: Any) -> List[str]:
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def field(entry: CatalogEntry, parent: str, key: str) -> Any:
+    container = entry.get(parent)
+    return container.get(key) if isinstance(container, dict) else None
+
+
+def stated_reasoning(entry: CatalogEntry) -> Optional[bool]:
+    """`supports_reasoning`, `reasoning: true` or `reasoning: {supported: true}`; an explicit false wins."""
+    stated = [
+        value
+        for value in (entry.get("supports_reasoning"), entry.get("reasoning"), field(entry, "reasoning", "supported"))
+        if isinstance(value, bool)
+    ]
+    if False in stated:
+        return False
+    return True if True in stated else None
+
+
+def thinking_level_map(effort_levels: List[str], always_on: bool) -> Dict[str, Optional[str]]:
+    """Maps Prime Agent's thinking levels onto the efforts a server lists; the others are hidden (null)."""
+    mapped: Dict[str, Optional[str]] = {"off": None if always_on else "none"}
+    for level in THINKING_LEVELS:
+        mapped[level] = level if level in effort_levels else None
+    return mapped
+
+
+def supports_tools(entry: CatalogEntry) -> bool:
+    """False for a model the endpoint says cannot call tools, which Prime Agent works through."""
+    # Chutes lists capabilities in supported_features, OpenRouter in supported_parameters.
+    capabilities = strings(entry.get("supported_features")) + strings(entry.get("supported_parameters"))
+    return not capabilities or "tools" in capabilities
+
+
+def thinking_traits(entry: CatalogEntry) -> Tuple[bool, List[str], bool]:
+    """(reasoning, listed effort levels, whether the server also needs enable_thinking)."""
+    capabilities = strings(entry.get("supported_features")) + strings(entry.get("supported_parameters"))
+    reasoning = stated_reasoning(entry)
+    if reasoning is None:
+        reasoning = "reasoning" in capabilities
+    # Effort levels are stated flat (Unsloth: reasoning_effort_levels) or nested (reasoning.levels).
+    levels = strings(entry.get("reasoning_effort_levels")) + strings(field(entry, "reasoning", "levels"))
+    gated = reasoning and entry.get("reasoning_style") == "enable_thinking_effort"
+    return reasoning, levels, gated
+
+
+def to_model(entry: CatalogEntry, endpoint: Endpoint) -> Optional[Dict[str, Any]]:
+    """The models.json model for a catalog entry, or None for one that cannot call tools."""
+    if not supports_tools(entry):
+        return None
+    context_window = int(
+        positive(entry.get("context_length"))
+        or positive(entry.get("max_model_len"))
+        or endpoint.get("contextWindow")
+        or DEFAULT_CONTEXT_WINDOW
+    )
+    output_limit = int(
+        positive(entry.get("max_output_length"))
+        or positive(entry.get("max_output_tokens"))
+        or positive(field(entry, "top_provider", "max_completion_tokens"))
+        or endpoint.get("maxTokens")
+        or DEFAULT_MAX_TOKENS
+    )
+    inputs = strings(entry.get("input_modalities")) + strings(field(entry, "architecture", "input_modalities"))
+    reasoning, levels, gated = thinking_traits(entry)
+    name = next((v.strip() for v in (entry.get("name"), entry.get("display_name")) if isinstance(v, str) and v.strip()), None)
+
+    model: Dict[str, Any] = {
+        "id": entry["id"],
+        "name": name or entry["id"],
+        "reasoning": reasoning,
+        "input": ["text", "image"] if "image" in inputs else ["text"],
+        # Endpoints report prices in different units, so usage is not priced.
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "contextWindow": context_window,
+        "maxTokens": min(output_limit, context_window),
+    }
+    if reasoning and levels and not gated:
+        model["thinkingLevelMap"] = thinking_level_map(levels, entry.get("reasoning_always_on") is True)
+    return model
+
+
+def provider_compat(entries: List[CatalogEntry]) -> Dict[str, Any]:
+    """Request settings for the whole endpoint: Prime Agent takes `compat` from the provider only.
+
+    The base is the broadly supported shape: a system message, max_tokens, no store. Models that
+    list effort levels get reasoning_effort. A server that wants enable_thinking next to
+    reasoning_effort gets the enable_thinking toggle alone, because Prime Agent has no
+    per-request hook: thinking on or off, no level. Where an endpoint has both kinds of
+    model, effort levels win.
+    """
+    compat: Dict[str, Any] = {"supportsStore": False, "supportsDeveloperRole": False, "maxTokensField": "max_tokens"}
+    traits = [thinking_traits(entry) for entry in entries if supports_tools(entry)]
+    if any(reasoning and levels and not gated for reasoning, levels, gated in traits):
+        compat["supportsReasoningEffort"] = True
+    elif any(gated for _, _, gated in traits):
+        compat["thinkingFormat"] = "qwen"
+    return compat
+
+
+def provider_block(endpoint: Endpoint, entries: List[CatalogEntry]) -> Dict[str, Any]:
+    models = [model for model in (to_model(entry, endpoint) for entry in entries) if model]
+    return {
+        "name": endpoint["name"],
+        "baseUrl": endpoint["baseUrl"],
+        "api": "openai-completions",
+        # A key saved in auth.json wins over this. With no saved key and the variable unset, its
+        # name is sent as the key: endpoints that need none ignore it, the rest reject it.
+        "apiKey": env_var_for(endpoint["id"]),
+        "compat": provider_compat(entries),
+        "models": models,
+    }
+
+
+# ---------------------------------------------------------------------------
+# models.json
+# ---------------------------------------------------------------------------
+
+
+def read_models_document() -> Dict[str, Any]:
+    document = read_json(models_path(), lenient=True)
+    if document is None:
+        return {}
+    if not isinstance(document, dict) or not isinstance(document.get("providers", {}), dict):
+        raise Fail(f'{models_path()}: "providers" must be an object')
+    return document
+
+
+def write_models_document(document: Dict[str, Any]) -> None:
+    path = models_path()
+    backup = path + ".before-endpoints"
+    # The file is rewritten as plain JSON, which drops comments: keep the original once.
+    if os.path.exists(path) and not os.path.exists(backup):
+        shutil.copy2(path, backup)
+    write_json_atomically(path, document, mode=None if os.path.exists(path) else 0o600)
+
+
+def sync_models(removed: Tuple[str, ...] = ()) -> Dict[str, int]:
+    """Regenerates the provider block of every enabled endpoint from its cached model list.
+
+    Providers of removed or disabled endpoints are deleted; every other provider is untouched.
+    Returns the model count per synced endpoint.
+    """
+    endpoints = read_endpoints()
+    document = read_models_document()
+    before = json.dumps(document, sort_keys=True)
+    providers: Dict[str, Any] = document.setdefault("providers", {})
+    counts: Dict[str, int] = {}
+    for endpoint_id in removed:
+        providers.pop(endpoint_id, None)
+    for endpoint in endpoints:
+        entries = read_cached_catalog(endpoint["id"])
+        if not endpoint["enabled"]:
+            providers.pop(endpoint["id"], None)
+        elif entries is not None:
+            block = provider_block(endpoint, entries)
+            providers[endpoint["id"]] = block
+            counts[endpoint["id"]] = len(block["models"])
+    if not providers and "providers" not in json.loads(before):
+        del document["providers"]
+    if json.dumps(document, sort_keys=True) != before:
+        write_models_document(document)
+    return counts
+
+
+def check_id_available(endpoint_id: str, endpoints: List[Endpoint]) -> None:
+    if any(endpoint["id"] == endpoint_id for endpoint in endpoints):
+        raise Fail(f'"{endpoint_id}" is already one of your endpoints; choose another name.')
+    if endpoint_id in BUILT_IN_PROVIDERS:
+        raise Fail(f'"{endpoint_id}" is a built-in provider in Prime Agent; choose another name.')
+    if endpoint_id in read_models_document().get("providers", {}):
+        raise Fail(f'"{endpoint_id}" is already a provider in {models_path()}; choose another name.')
+    credential = read_auth().get(endpoint_id)
+    if credential is not None and not (isinstance(credential, dict) and credential.get("type") == "api_key"):
+        raise Fail(f'"{endpoint_id}" already has a sign-in saved in Prime Agent; choose another name.')
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+# ---------------------------------------------------------------------------
+# Operations
+# ---------------------------------------------------------------------------
+
+
+def op_add(
+    url: str,
+    key: Optional[str],
+    name: Optional[str] = None,
+    endpoint_id: Optional[str] = None,
+    context_window: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> Tuple[Endpoint, int]:
+    if not is_http_url(url):
+        raise Fail(f'"{url}" is not an http or https URL.')
+    base_url = url.rstrip("/")
+    try:
+        entries = fetch_catalog(base_url, key)
+    except Fail as error:
+        raise Fail(f"Not added: {error}") from error
+    name = (name or "").strip() or urllib.parse.urlsplit(base_url).netloc
+    endpoint_id = endpoint_id or slugify(name)
+    if not ID_PATTERN.match(endpoint_id):
+        raise Fail(f'"{endpoint_id}" is not a valid id: use lowercase letters, digits and single dashes.')
+    endpoints = read_endpoints()
+    check_id_available(endpoint_id, endpoints)
+    endpoint: Endpoint = {"id": endpoint_id, "name": name, "baseUrl": base_url, "enabled": True}
+    if context_window:
+        endpoint["contextWindow"] = context_window
+    if max_tokens:
+        endpoint["maxTokens"] = max_tokens
+
+    write_json_atomically(cache_path(endpoint_id), {"refreshedAt": int(time.time() * 1000), "data": entries})
+    if key:
+        save_key(endpoint_id, key)
+    write_endpoints(endpoints + [endpoint])
+    sync_models()
+    return endpoint, sum(1 for entry in entries if to_model(entry, endpoint))
+
+
+def op_refresh(endpoint: Endpoint) -> int:
+    """Fetches the endpoint's models into its cache and regenerates models.json."""
+    entries = fetch_catalog(endpoint["baseUrl"], key_for(endpoint["id"]))
+    write_json_atomically(cache_path(endpoint["id"]), {"refreshedAt": int(time.time() * 1000), "data": entries})
+    sync_models()
+    return sum(1 for entry in entries if to_model(entry, endpoint))
+
+
+def op_set_enabled(endpoint_id: str, enabled: bool) -> None:
+    endpoints = read_endpoints()
+    find_endpoint(endpoints, endpoint_id)["enabled"] = enabled
+    write_endpoints(endpoints)
+    sync_models()
+
+
+def op_set_key(endpoint_id: str, key: Optional[str]) -> None:
+    find_endpoint(read_endpoints(), endpoint_id)
+    save_key(endpoint_id, key)
+
+
+def op_set_url(endpoint_id: str, url: str) -> int:
+    if not is_http_url(url):
+        raise Fail(f'"{url}" is not an http or https URL.')
+    endpoints = read_endpoints()
+    endpoint = find_endpoint(endpoints, endpoint_id)
+    base_url = url.rstrip("/")
+    try:
+        entries = fetch_catalog(base_url, key_for(endpoint_id))
+    except Fail as error:
+        raise Fail(f"URL not changed: {error}") from error
+    endpoint["baseUrl"] = base_url
+    write_json_atomically(cache_path(endpoint_id), {"refreshedAt": int(time.time() * 1000), "data": entries})
+    write_endpoints(endpoints)
+    sync_models()
+    return sum(1 for entry in entries if to_model(entry, endpoint))
+
+
+def op_remove(endpoint_id: str) -> None:
+    endpoints = read_endpoints()
+    find_endpoint(endpoints, endpoint_id)
+    write_endpoints([endpoint for endpoint in endpoints if endpoint["id"] != endpoint_id])
+    if stored_key(endpoint_id):
+        save_key(endpoint_id, None)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(cache_path(endpoint_id))
+    sync_models(removed=(endpoint_id,))
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+
+def models_in_use(endpoint_id: str) -> Optional[int]:
+    provider = read_models_document().get("providers", {}).get(endpoint_id)
+    return len(provider.get("models", [])) if isinstance(provider, dict) else None
+
+
+def describe_key(endpoint_id: str) -> str:
+    if stored_key(endpoint_id):
+        return "key saved"
+    if os.environ.get(env_var_for(endpoint_id)):
+        return f"key from ${env_var_for(endpoint_id)}"
+    return "no key"
+
+
+def describe_endpoint(endpoint: Endpoint) -> str:
+    host = urllib.parse.urlsplit(endpoint["baseUrl"]).netloc
+    status = "disabled"
+    if endpoint["enabled"]:
+        count = models_in_use(endpoint["id"])
+        status = "no model list yet; run refresh" if count is None else f"{count} models"
+    return f'{endpoint["name"]} [{endpoint["id"]}] - {host} - {status} - {describe_key(endpoint["id"])}'
+
+
+def cmd_list(_args: argparse.Namespace) -> None:
+    endpoints = read_endpoints()
+    if not endpoints:
+        print("No endpoints yet. Add one with: prime-agent-endpoints add <url>")
+    for endpoint in endpoints:
+        print(describe_endpoint(endpoint))
+
+
+def read_key(args: argparse.Namespace, prompt: str) -> Optional[str]:
+    """The key from --key-stdin, --key-env or a hidden prompt; None for no key."""
+    if getattr(args, "no_key", False):
+        return None
+    if getattr(args, "key_stdin", False):
+        return sys.stdin.readline().strip() or None
+    variable = getattr(args, "key_env", None)
+    if variable:
+        value = os.environ.get(variable, "").strip()
+        if not value:
+            raise Fail(f"${variable} is not set.")
+        return value
+    if not sys.stdin.isatty():
+        raise Fail("Pass the key with --key-stdin or --key-env NAME (or --no-key when the endpoint needs none).")
+    return getpass.getpass(prompt).strip() or None
+
+
+def after_change(endpoint_id: str, count: int, verb: str) -> None:
+    print(f"{verb}: {count} models. Choose one with /model {endpoint_id}; restart Prime Agent or run /reload first if it is running.")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    url = args.url or (input("Endpoint URL, usually ending in /v1: ").strip() if sys.stdin.isatty() else "")
+    if not url:
+        raise Fail("Give the endpoint URL: prime-agent-endpoints add <url>")
+    key = read_key(args, "API key (leave empty if the endpoint needs none): ")
+    name = args.name
+    if name is None and sys.stdin.isatty():
+        host = urllib.parse.urlsplit(url).netloc
+        name = input(f"Name (leave empty for {host}): ").strip() or None
+    endpoint, count = op_add(url, key, name, args.id, args.context_window, args.max_tokens)
+    if count == 0:
+        print(f'Added {endpoint["name"]} [{endpoint["id"]}], but it lists no models the agent can use.')
+    else:
+        after_change(endpoint["id"], count, f'Added {endpoint["name"]} [{endpoint["id"]}]')
+
+
+def cmd_refresh(args: argparse.Namespace) -> None:
+    endpoints = read_endpoints()
+    if args.id:
+        targets = [find_endpoint(endpoints, args.id)]
+    else:
+        targets = [endpoint for endpoint in endpoints if endpoint["enabled"]]
+    failed = False
+    for endpoint in targets:
+        try:
+            count = op_refresh(endpoint)
+        except Fail as error:
+            failed = True
+            print(f'{endpoint["name"]}: {error}', file=sys.stderr)
+        else:
+            print(f'{endpoint["name"]}: {count} models.')
+    if failed:
+        raise SystemExit(1)
+
+
+def cmd_enable(args: argparse.Namespace) -> None:
+    op_set_enabled(args.id, True)
+    endpoint = find_endpoint(read_endpoints(), args.id)
+    try:
+        after_change(args.id, op_refresh(endpoint), f'{endpoint["name"]} enabled')
+    except Fail as error:
+        print(f'{endpoint["name"]} enabled, but its models could not be refreshed: {error}', file=sys.stderr)
+
+
+def cmd_disable(args: argparse.Namespace) -> None:
+    op_set_enabled(args.id, False)
+    print(f"{args.id} disabled. Its settings and key are kept; its models are hidden once Prime Agent reloads.")
+
+
+def cmd_key(args: argparse.Namespace) -> None:
+    if args.remove:
+        op_set_key(args.id, None)
+        print(f"Deleted the saved key for {args.id}.")
+        return
+    key = read_key(args, f"API key for {args.id}: ")
+    if not key:
+        raise Fail("No key given. Use --remove to delete the saved key.")
+    op_set_key(args.id, key)
+    print(f"Saved the key for {args.id}.")
+    try:
+        print(f'Refreshed: {op_refresh(find_endpoint(read_endpoints(), args.id))} models.')
+    except Fail as error:
+        print(f"The key is saved, but the models could not be refreshed: {error}", file=sys.stderr)
+
+
+def cmd_url(args: argparse.Namespace) -> None:
+    after_change(args.id, op_set_url(args.id, args.url), f"{args.id} now uses {args.url.rstrip('/')}")
+
+
+def confirm(question: str) -> bool:
+    return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    endpoint = find_endpoint(read_endpoints(), args.id)
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise Fail("Removing deletes the saved key too. Pass --yes to confirm.")
+        if not confirm(f'Remove {endpoint["name"]}? Its saved API key is deleted too.'):
+            return
+    op_remove(args.id)
+    print(f'{endpoint["name"]} removed.')
+
+
+def cmd_sync(_args: argparse.Namespace) -> None:
+    counts = sync_models()
+    for endpoint_id, count in counts.items():
+        print(f"{endpoint_id}: {count} models.")
+    missing = [e["id"] for e in read_endpoints() if e["enabled"] and e["id"] not in counts]
+    if missing:
+        print(f"No model list yet for {', '.join(missing)}; run: prime-agent-endpoints refresh", file=sys.stderr)
+
+
+def menu() -> None:
+    while True:
+        endpoints = read_endpoints()
+        print("\nEndpoints")
+        for number, endpoint in enumerate(endpoints, 1):
+            print(f"  {number}) {describe_endpoint(endpoint)}")
+        print("  a) Add an endpoint\n  q) Quit")
+        choice = input("> ").strip().lower()
+        try:
+            if choice in ("q", ""):
+                return
+            if choice == "a":
+                args = argparse.Namespace(url=None, name=None, id=None, context_window=None, max_tokens=None)
+                cmd_add(args)
+            elif choice.isdigit() and 1 <= int(choice) <= len(endpoints):
+                manage(endpoints[int(choice) - 1])
+            else:
+                print("Choose a number, a or q.")
+        except Fail as error:
+            print(f"error: {error}", file=sys.stderr)
+
+
+def manage(endpoint: Endpoint) -> None:
+    endpoint_id = endpoint["id"]
+    toggle = "Disable" if endpoint["enabled"] else "Enable"
+    print(f'\n{describe_endpoint(endpoint)}\n  1) {toggle}\n  2) Refresh models\n  3) Change API key\n  4) Change URL\n  5) Remove\n  b) Back')
+    choice = input("> ").strip().lower()
+    if choice == "1":
+        (cmd_disable if endpoint["enabled"] else cmd_enable)(argparse.Namespace(id=endpoint_id))
+    elif choice == "2":
+        cmd_refresh(argparse.Namespace(id=endpoint_id))
+    elif choice == "3":
+        cmd_key(argparse.Namespace(id=endpoint_id, remove=False))
+    elif choice == "4":
+        url = input(f'URL for {endpoint["name"]} [{endpoint["baseUrl"]}]: ').strip()
+        if url:
+            cmd_url(argparse.Namespace(id=endpoint_id, url=url))
+    elif choice == "5":
+        cmd_remove(argparse.Namespace(id=endpoint_id, yes=False))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="prime-agent-endpoints",
+        description="Manage OpenAI-compatible endpoints for Prime Agent. With no command, opens a menu.",
+        epilog="A running Prime Agent may need a restart or /reload before /model shows a change.",
+    )
+    commands = parser.add_subparsers(dest="command", metavar="command")
+
+    def command(name: str, handler: Any, help_text: str) -> argparse.ArgumentParser:
+        sub = commands.add_parser(name, help=help_text, description=help_text)
+        sub.set_defaults(handler=handler)
+        return sub
+
+    def key_options(sub: argparse.ArgumentParser, with_no_key: bool) -> None:
+        group = sub.add_mutually_exclusive_group()
+        group.add_argument("--key-stdin", action="store_true", help="read the API key from the first line of stdin")
+        group.add_argument("--key-env", metavar="NAME", help="read the API key from this environment variable")
+        if with_no_key:
+            group.add_argument("--no-key", action="store_true", help="the endpoint needs no key")
+
+    command("list", cmd_list, "list endpoints, their model counts and key status")
+
+    add = command("add", cmd_add, "check an endpoint by listing its models, then add it")
+    add.add_argument("url", nargs="?", help="the endpoint URL, usually ending in /v1")
+    add.add_argument("--name", help="display name (default: the URL's host)")
+    add.add_argument("--id", help="provider id used in /model (default: derived from the name)")
+    add.add_argument("--context-window", type=int, metavar="N", help="for models whose context size the endpoint does not report")
+    add.add_argument("--max-tokens", type=int, metavar="N", help="for models whose output limit the endpoint does not report")
+    key_options(add, with_no_key=True)
+
+    refresh = command("refresh", cmd_refresh, "re-read an endpoint's models (every enabled endpoint without an id)")
+    refresh.add_argument("id", nargs="?")
+
+    for name, handler, text in (("enable", cmd_enable, "show an endpoint's models again"), ("disable", cmd_disable, "hide an endpoint's models, keeping its settings and key")):
+        sub = command(name, handler, text)
+        sub.add_argument("id")
+
+    key = command("key", cmd_key, "save or delete an endpoint's API key")
+    key.add_argument("id")
+    key.add_argument("--remove", action="store_true", help="delete the saved key")
+    key_options(key, with_no_key=False)
+
+    url = command("url", cmd_url, "point an endpoint at another URL")
+    url.add_argument("id")
+    url.add_argument("url")
+
+    remove = command("remove", cmd_remove, "remove an endpoint and its saved key")
+    remove.add_argument("id")
+    remove.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+
+    command("sync", cmd_sync, "rebuild models.json from endpoints.json and the cached model lists, without network")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command is None:
+            if not sys.stdin.isatty():
+                cmd_list(args)
+                return 0
+            menu()
+        else:
+            args.handler(args)
+    except Fail as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print(file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
