@@ -1,9 +1,8 @@
-name: Extensions
+name: Endpoints helper
 
-# Tests the endpoints and Chutes extensions against Prime Agent's latest release,
-# both the npm build and the compiled binary, then publishes the installer and
-# extensions to GitHub Pages. The daily run catches a Prime Agent release that
-# breaks an extension; GitHub only runs schedules on the default branch.
+# Tests the endpoints helper against Prime Agent's latest release, then publishes
+# the installer and the helper to GitHub Pages. The daily run catches a Prime Agent
+# release that breaks the helper; GitHub only runs schedules on the default branch.
 
 on:
   push:
@@ -31,10 +30,9 @@ jobs:
         id: find
         run: |
           set -eu
-          # The pattern matches the installer's literal ${PRIME_AGENT_DOWNLOAD_BASE_URL:-...} line.
-          # shellcheck disable=SC2016
+          # The pattern matches the installer's literal DOWNLOAD_BASE_URL_DEFAULT line.
           base_url=$(curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh |
-            sed -n 's/^prime_agent_base_url="\${PRIME_AGENT_DOWNLOAD_BASE_URL:-\(.*\)}"$/\1/p')
+            sed -n 's/^DOWNLOAD_BASE_URL_DEFAULT="\(.*\)"$/\1/p')
           version=$(curl -fsSL "$base_url/stable")
           version=${version#v}
           if [ -z "$base_url" ] || [ -z "$version" ]; then
@@ -46,63 +44,38 @@ jobs:
           echo "Prime Agent $version from $base_url"
 
   test:
-    name: Test on Prime Agent ${{ needs.release.outputs.version }} (${{ matrix.install }})
+    name: Test on Prime Agent ${{ needs.release.outputs.version }}
     needs: release
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        install: [npm, binary]
     env:
       BASE_URL: ${{ needs.release.outputs.base_url }}
       VERSION: ${{ needs.release.outputs.version }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7.0.0
-        with:
-          node-version: 22
-
-      - name: Install dependencies, using this Prime Agent release for types
-        run: |
-          set -eu
-          npm install --no-audit --no-fund
-          npm install --no-audit --no-fund --no-save \
-            "@earendil-works/pi-coding-agent@$BASE_URL/releases/v$VERSION/prime-agent-$VERSION.tgz"
-
-      - name: Typecheck
-        run: npm run check
+      - name: Lint the shell scripts
+        run: shellcheck -x install.sh test/e2e-endpoints.sh test/e2e/lib.sh
 
       - name: Unit tests
-        run: npm test
+        run: python3 -W error::ResourceWarning -m unittest discover -s test -v
 
-      - name: Install Prime Agent (${{ matrix.install }})
+      - name: Install Prime Agent
         id: agent
-        env:
-          INSTALL: ${{ matrix.install }}
         run: |
           set -eu
           dir="$RUNNER_TEMP/prime-agent"
+          archive="prime-agent-$VERSION-linux-x64.tar.gz"
           mkdir -p "$dir"
-          if [ "$INSTALL" = npm ]; then
-            npm install --global --prefix "$dir" --no-audit --no-fund "$BASE_URL/releases/v$VERSION/prime-agent-$VERSION.tgz"
-            echo "bin=$dir/bin/prime-agent" >> "$GITHUB_OUTPUT"
-          else
-            archive="prime-agent-$VERSION-linux-x64.tar.gz"
-            cd "$dir"
-            curl -fsSLO "$BASE_URL/releases/v$VERSION/$archive"
-            curl -fsSL "$BASE_URL/releases/v$VERSION/SHA256SUMS" | grep " $archive\$" | sha256sum -c -
-            tar -xzf "$archive"
-            echo "bin=$dir/prime-agent" >> "$GITHUB_OUTPUT"
-          fi
+          cd "$dir"
+          curl -fsSLO "$BASE_URL/releases/v$VERSION/$archive"
+          curl -fsSL "$BASE_URL/releases/v$VERSION/SHA256SUMS" | grep " $archive\$" | sha256sum -c -
+          tar -xzf "$archive"
+          echo "bin=$dir/prime-agent" >> "$GITHUB_OUTPUT"
 
       - name: End-to-end tests
         env:
           AGENT_BIN: ${{ steps.agent.outputs.bin }}
-        run: |
-          set -eu
-          test/e2e-chutes.sh "$AGENT_BIN"
-          test/e2e-endpoints.sh "$AGENT_BIN"
+        run: test/e2e-endpoints.sh "$AGENT_BIN"
 
   installer:
     name: Test the installer
@@ -115,29 +88,36 @@ jobs:
           set -eu
           site="$RUNNER_TEMP/site"
           home="$RUNNER_TEMP/home"
-          mkdir -p "$site/extensions" "$home"
-          cp extensions/endpoints.ts extensions/chutes.ts "$site/extensions/"
-          (cd "$site/extensions" && sha256sum endpoints.ts chutes.ts > SHA256SUMS)
+          mkdir -p "$site/helper" "$home/.prime/agent/extensions" "$home/.prime/agent/endpoints"
+          cp helper/prime-agent-endpoints "$site/helper/"
+          (cd "$site/helper" && sha256sum prime-agent-endpoints > SHA256SUMS)
           python3 -m http.server 8765 --bind 127.0.0.1 --directory "$site" >/dev/null 2>&1 &
           sleep 1
-          run_installer() {
-            env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
-              PRIME_AGENT_EXTENSIONS_BASE_URL=http://127.0.0.1:8765 \
-              PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 \
-              PRIME_AGENT_INSTALLER_PLAIN=1 PRIME_AGENT_SHELL_PROFILE="$home/.profile" \
-              "$@" sh install.sh </dev/null
+
+          # What an earlier installer left: its two extensions, one of the user's own,
+          # and an endpoint with its saved model list.
+          printf '/**\n * OpenAI-compatible endpoints for Prime Agent.\n */\n' > "$home/.prime/agent/extensions/endpoints.ts"
+          printf '/**\n * Chutes provider for Prime Agent.\n */\n' > "$home/.prime/agent/extensions/chutes.ts"
+          printf '// mine\n' > "$home/.prime/agent/extensions/mine.ts"
+          echo '{"endpoints":[{"id":"gpu","name":"GPU","baseUrl":"http://127.0.0.1:9/v1","enabled":true}]}' > "$home/.prime/agent/endpoints.json"
+          echo '{"refreshedAt":1,"data":[{"id":"m1"},{"id":"m2"}]}' > "$home/.prime/agent/endpoints/gpu.models.json"
+
+          env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" \
+            PRIME_AGENT_ENDPOINTS_BASE_URL=http://127.0.0.1:8765 \
+            PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 \
+            PRIME_AGENT_INSTALLER_PLAIN=1 PRIME_AGENT_SHELL_PROFILE="$home/.profile" \
+            sh install.sh </dev/null
+
+          run() {
+            env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" PI_SKIP_VERSION_CHECK=1 TERM=dumb "$@" </dev/null
           }
-
-          # By default: Prime Agent and the endpoints extension.
-          run_installer
-          env -i HOME="$home" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP" PI_SKIP_VERSION_CHECK=1 \
-            "$home/.local/bin/prime-agent" --version </dev/null
-          cmp extensions/endpoints.ts "$home/.prime/agent/extensions/endpoints.ts"
+          run "$home/.local/bin/prime-agent" --version
+          cmp helper/prime-agent-endpoints "$home/.prime/agent/helpers/prime-agent-endpoints"
+          test ! -e "$home/.prime/agent/extensions/endpoints.ts"
           test ! -e "$home/.prime/agent/extensions/chutes.ts"
-
-          # Asked for Chutes: it is added.
-          run_installer PRIME_AGENT_WITH_CHUTES=1
-          cmp extensions/chutes.ts "$home/.prime/agent/extensions/chutes.ts"
+          test -e "$home/.prime/agent/extensions/mine.ts"
+          run "$home/.local/bin/prime-agent-endpoints" list | grep -q 'GPU \[gpu\].* 2 models'
+          run "$home/.local/bin/prime-agent" model list | grep -c '^gpu ' | grep -qx 2
 
   publish:
     name: Publish to GitHub Pages
@@ -158,16 +138,16 @@ jobs:
           ref: gh-pages
           path: site
 
-      - name: Stage the installer, extension and landing page
+      - name: Stage the installer, helper and landing page
         run: |
           set -eu
           cp install.sh site/install.sh
           # The former beta installer URL gets the same setup.
           cp install.sh site/install-beta.sh
           cp pages/index.md site/index.md
-          mkdir -p site/extensions
-          cp extensions/chutes.ts extensions/endpoints.ts site/extensions/
-          (cd site/extensions && sha256sum chutes.ts endpoints.ts > SHA256SUMS)
+          mkdir -p site/helper
+          cp helper/prime-agent-endpoints site/helper/
+          (cd site/helper && sha256sum prime-agent-endpoints > SHA256SUMS)
 
       - name: Commit and push the site
         id: site
@@ -176,13 +156,13 @@ jobs:
           set -eu
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add install.sh install-beta.sh index.md extensions
+          git add install.sh install-beta.sh index.md helper
           if git diff --cached --quiet; then
             echo "The site already serves this version."
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git commit -m "publish the chutes extension from ${GITHUB_SHA::12}"
+          git commit -m "publish the endpoints helper from ${GITHUB_SHA::12}"
           git push origin HEAD:gh-pages
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
@@ -194,12 +174,12 @@ jobs:
           # Pushes made with GITHUB_TOKEN do not start a Pages build on their own.
           gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null
 
-      - name: Wait for the site to serve these extensions
+      - name: Wait for the site to serve this helper
         run: |
           set -eu
           owner=$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
-          url="https://$owner.github.io/${GITHUB_REPOSITORY#*/}/extensions/SHA256SUMS"
-          expected=$(cd extensions && sha256sum chutes.ts endpoints.ts)
+          url="https://$owner.github.io/${GITHUB_REPOSITORY#*/}/helper/SHA256SUMS"
+          expected=$(cd helper && sha256sum prime-agent-endpoints)
           for attempt in $(seq 60); do
             # A unique query string skips the CDN's cached copy.
             if [ "$(curl -fsSL "$url?check=$GITHUB_RUN_ID-$attempt" 2>/dev/null || true)" = "$expected" ]; then
@@ -208,5 +188,5 @@ jobs:
             fi
             sleep 20
           done
-          echo "::error::$url did not serve the new extensions within 20 minutes."
+          echo "::error::$url did not serve the new helper within 20 minutes."
           exit 1
