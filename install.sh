@@ -97,8 +97,9 @@ download_helper() {
 	fi
 }
 
-# The helper is a Python 3 script. The launcher finds a Python for it: uv's, which Prime
-# Agent's installer provides, then python3 on PATH. It is written here and not downloaded.
+# The helper is a Python 3 script. The launcher finds a Python for it: python3 on PATH,
+# else uv's, which Prime Agent's installer provides. uv runs without its cache, so an
+# unwritable cache directory cannot stop it. The launcher is written here, not downloaded.
 place_helper() {
 	mkdir -p "$helper_dir" "$bin_dir"
 	# Not the final name until complete, so a half-written file is never run.
@@ -108,13 +109,13 @@ place_helper() {
 #!/bin/sh
 # Written by the Prime Agent endpoints installer.
 script='$helper_dir/$helper_name'
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
+	exec python3 "\$script" "\$@"
+fi
 uv=\$(command -v uv 2>/dev/null || true)
 [ -n "\$uv" ] || [ ! -x "\$HOME/.local/bin/uv" ] || uv=\$HOME/.local/bin/uv
 if [ -n "\$uv" ]; then
-	exec "\$uv" run --no-project --quiet --python '>=3.9' python "\$script" "\$@"
-fi
-if command -v python3 >/dev/null 2>&1; then
-	exec python3 "\$script" "\$@"
+	exec "\$uv" run --no-cache --no-project --quiet --python '>=3.9' python "\$script" "\$@"
 fi
 echo "$helper_name needs Python 3.9 or newer, or uv" >&2
 exit 1

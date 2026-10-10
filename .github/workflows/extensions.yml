@@ -117,6 +117,9 @@ jobs:
           test ! -e "$home/.prime/agent/extensions/chutes.ts"
           test -e "$home/.prime/agent/extensions/mine.ts"
           run "$home/.local/bin/prime-agent-endpoints" list | grep -q 'GPU \[gpu\].* 2 models'
+          # With no python3 on PATH the launcher uses uv, even when uv's cache cannot be written.
+          env -i HOME="$home" PATH="$home/.local/bin" UV_CACHE_DIR=/proc/no-such-dir/uv \
+            "$home/.local/bin/prime-agent-endpoints" list | grep -q 'GPU \[gpu\].* 2 models'
           run "$home/.local/bin/prime-agent" model list | grep -c '^gpu ' | grep -qx 2
 
   publish:
